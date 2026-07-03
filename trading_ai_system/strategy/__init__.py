@@ -1,22 +1,51 @@
 """
 Strategy Module - Trading strategies and signal generation
 
-Exports:
-- Strategy base classes
+v79.1 Exports:
 - Signal generation
-- Performance tracking
+- Walk-forward validation
+- Strategy validation
+- Live trading caching
 """
 
-from trading_ai_system.strategy.strategy import (
-    BaseStrategy,
-    MLStrategy,
-    StrategyPerformance,
+from .strategy import (
+    # Enums
+    Signal,
+    
+    # Data Classes
+    SignalResult,
+    BacktestMetrics,
+    WalkForwardResult,
+    
+    # Classes
     SignalGenerator,
+    WalkForwardEngine,
+    StrategyValidator,
+    LiveLiteMode,
+    
+    # Functions
+    get_signal_generator,
+    get_live_lite_mode,
 )
 
 __all__ = [
-    "BaseStrategy",
-    "MLStrategy",
-    "StrategyPerformance",
+    # Enums
+    "Signal",
+    
+    # Data Classes
+    "SignalResult",
+    "BacktestMetrics",
+    "WalkForwardResult",
+    
+    # Classes
     "SignalGenerator",
+    "WalkForwardEngine",
+    "StrategyValidator",
+    "LiveLiteMode",
+    
+    # Functions
+    "get_signal_generator",
+    "get_live_lite_mode",
 ]
+
+__version__ = "0.79.1"

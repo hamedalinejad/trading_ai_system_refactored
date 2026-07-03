@@ -1,22 +1,47 @@
 """
 Risk Module - Risk management and position sizing
 
-Exports:
-- Risk management classes
+v79.1 Exports:
+- Risk assessment and gating
 - Position sizing calculators
-- Portfolio constraints
+- Production risk engine
+- Risk metrics and monitoring
 """
 
-from trading_ai_system.risk.risk import (
-    RiskManager,
-    PositionSizer,
-    PortfolioConstraints,
+from .risk import (
+    # Enums
+    RiskLevel,
+    
+    # Data Classes
     RiskMetrics,
+    PositionSizeResult,
+    
+    # Functions
+    calculate_position_size,
+    fractional_kelly_with_vol_target,
+    
+    # Classes
+    TradeGatingEngine,
+    RiskBrain,
+    ProductionRiskEngine,
 )
 
 __all__ = [
-    "RiskManager",
-    "PositionSizer",
-    "PortfolioConstraints",
+    # Enums
+    "RiskLevel",
+    
+    # Data Classes
     "RiskMetrics",
+    "PositionSizeResult",
+    
+    # Functions
+    "calculate_position_size",
+    "fractional_kelly_with_vol_target",
+    
+    # Classes
+    "TradeGatingEngine",
+    "RiskBrain",
+    "ProductionRiskEngine",
 ]
+
+__version__ = "0.79.1"

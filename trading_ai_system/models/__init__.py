@@ -1,22 +1,60 @@
 """
 Models Module - Machine learning models and predictions
 
-Exports:
+v79.1 Exports:
 - Base model classes
 - LightGBM models
-- Model evaluation and importance
+- Ensemble methods
+- Meta models (stacking)
+- Model evaluation utilities
 """
 
-from trading_ai_system.models.models import (
+from .models import (
+    # Data Classes
+    PredictionResult,
+    ModelMetrics,
+    ModelCheckpoint,
+    
+    # Base Classes
     BaseModel,
-    LGBModel,
-    ModelEnsemble,
-    ModelEvaluator,
+    LightGBMModel,
+    EnsembleModel,
+    MetaModel,
+    IsotonicCalibrator,
+    
+    # Exceptions
+    ModelError,
+    ModelInferenceError,
+    ModelTrainingError,
+    ModelValidationError,
+    
+    # Functions
+    calculate_metrics,
+    get_feature_importance,
 )
 
 __all__ = [
+    # Data Classes
+    "PredictionResult",
+    "ModelMetrics",
+    "ModelCheckpoint",
+    
+    # Base Classes
     "BaseModel",
-    "LGBModel",
-    "ModelEnsemble",
-    "ModelEvaluator",
+    "LightGBMModel",
+    "EnsembleModel",
+    "MetaModel",
+    "IsotonicCalibrator",
+    
+    # Exceptions
+    "ModelError",
+    "ModelInferenceError",
+    "ModelTrainingError",
+    "ModelValidationError",
+    
+    # Functions
+    "calculate_metrics",
+    "get_feature_importance",
 ]
+
+__version__ = "0.79.1"
