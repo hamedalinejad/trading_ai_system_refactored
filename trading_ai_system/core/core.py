@@ -11,11 +11,12 @@ import hashlib
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from contextlib import contextmanager
 from contextvars import ContextVar
+from threading import Lock
 
 import numpy as np
 import pandas as pd
@@ -24,7 +25,7 @@ import pandas as pd
 # VERSION & METADATA
 # ═══════════════════════════════════════════════════════════════════════════
 
-__version__ = "0.79.0"
+__version__ = "0.79.1"
 __author__ = "Trading AI System"
 __description__ = "Production-grade algorithmic trading system with ML models"
 
@@ -33,11 +34,24 @@ __description__ = "Production-grade algorithmic trading system with ML models"
 # LOGGING SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+_log_lock = Lock()
+
+
+def _get_logger(name: str) -> logging.Logger:
+    """Thread-safe logger creation."""
+    with _log_lock:
+        logger = logging.getLogger(name)
+        if not logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        return logger
+
+
+logger = _get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -71,6 +85,16 @@ class ModelError(TradingSystemError):
 
 class ExecutionError(TradingSystemError):
     """Order execution error."""
+    pass
+
+
+class StrategyError(TradingSystemError):
+    """Strategy execution error."""
+    pass
+
+
+class RiskError(TradingSystemError):
+    """Risk management error."""
     pass
 
 
@@ -212,11 +236,31 @@ class SystemConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'SystemConfig':
         """Create from dictionary."""
+        data = data.copy()  # BUG FIX #1: Avoid modifying original dict
         if 'market_type' in data and isinstance(data['market_type'], str):
             data['market_type'] = MarketType(data['market_type'])
         if 'base_timeframe' in data and isinstance(data['base_timeframe'], str):
             data['base_timeframe'] = TimeFrame(data['base_timeframe'])
         return cls(**data)
+    
+    def validate(self) -> Tuple[bool, List[str]]:
+        """Validate configuration values."""
+        errors = []
+        
+        if not self.symbol:
+            errors.append("symbol cannot be empty")
+        if self.commission_per_side < 0 or self.commission_per_side > 1:
+            errors.append("commission_per_side must be between 0 and 1")
+        if self.slippage_pct < 0 or self.slippage_pct > 1:
+            errors.append("slippage_pct must be between 0 and 1")
+        if self.max_position_size <= 0 or self.max_position_size > 1:
+            errors.append("max_position_size must be between 0 and 1")
+        if self.max_drawdown <= 0 or self.max_drawdown > 1:
+            errors.append("max_drawdown must be between 0 and 1")
+        if self.test_size <= 0 or self.test_size >= 1:
+            errors.append("test_size must be between 0 and 1")
+        
+        return len(errors) == 0, errors
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -227,22 +271,30 @@ class GlobalState:
     """Singleton for global system state."""
     
     _instance = None
+    _lock = Lock()
     
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
         if self._initialized:
             return
         
-        self._initialized = True
-        self._config = SystemConfig()
-        self._feature_registry = {}
-        self._models = {}
-        self._cache = {}
+        with self._lock:
+            if self._initialized:
+                return
+                
+            self._initialized = True
+            self._config = SystemConfig()
+            self._feature_registry = {}
+            self._models = {}
+            self._cache = {}
+            self._cache_lock = Lock()
     
     def get_config(self) -> SystemConfig:
         """Get system configuration."""
@@ -250,28 +302,43 @@ class GlobalState:
     
     def set_config(self, config: SystemConfig) -> None:
         """Set system configuration."""
+        if not isinstance(config, SystemConfig):
+            raise ConfigError("Configuration must be SystemConfig instance")
+        
+        valid, errors = config.validate()
+        if not valid:
+            raise ConfigError(f"Invalid configuration: {errors}")
+        
         self._config = config
         logger.info(f"Config updated: {config.symbol} {config.market_type}")
     
     def register_feature(self, name: str, metadata: Dict[str, Any]) -> None:
         """Register a feature."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Feature name must be non-empty string")
+        if not isinstance(metadata, dict):
+            raise ValueError("Feature metadata must be dictionary")
+        
         self._feature_registry[name] = metadata
     
     def get_feature_registry(self) -> Dict[str, Any]:
         """Get all registered features."""
-        return self._feature_registry
+        return self._feature_registry.copy()
     
     def get_cached(self, key: str) -> Optional[Any]:
-        """Get cached value."""
-        return self._cache.get(key)
+        """Get cached value with thread-safe access."""
+        with self._cache_lock:
+            return self._cache.get(key)
     
     def set_cached(self, key: str, value: Any) -> None:
-        """Cache a value."""
-        self._cache[key] = value
+        """Cache a value with thread-safe access."""
+        with self._cache_lock:
+            self._cache[key] = value
     
     def clear_cache(self) -> None:
         """Clear cache."""
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -279,10 +346,12 @@ class GlobalState:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _config_context: ContextVar[Optional[SystemConfig]] = ContextVar(
-    "config_context", default=None
+    '_config_context', 
+    default=None
 )
 _request_config: ContextVar[Dict[str, Any]] = ContextVar(
-    "request_config", default={}
+    '_request_config', 
+    default={}
 )
 
 
@@ -291,13 +360,16 @@ _request_config: ContextVar[Dict[str, Any]] = ContextVar(
 # ═══════════════════════════════════════════════════════════════════════════
 
 _global_state = None
+_state_lock = Lock()
 
 
 def get_global_state() -> GlobalState:
-    """Get or create global state singleton."""
+    """Get or create global state singleton (thread-safe)."""
     global _global_state
     if _global_state is None:
-        _global_state = GlobalState()
+        with _state_lock:
+            if _global_state is None:
+                _global_state = GlobalState()
     return _global_state
 
 
@@ -314,12 +386,16 @@ def get_global_config() -> SystemConfig:
 
 def set_global_config(config: SystemConfig) -> None:
     """Set global system configuration."""
+    if not isinstance(config, SystemConfig):
+        raise ConfigError("Configuration must be SystemConfig instance")
     get_global_state().set_config(config)
 
 
 @contextmanager
 def config_context(config: SystemConfig):
     """Context manager for temporary config override."""
+    if not isinstance(config, SystemConfig):
+        raise ConfigError("Configuration must be SystemConfig instance")
     token = _config_context.set(config)
     try:
         yield config
@@ -329,12 +405,14 @@ def config_context(config: SystemConfig):
 
 def get_request_config() -> Dict[str, Any]:
     """Get request-specific configuration."""
-    return _request_config.get()
+    return _request_config.get().copy()
 
 
 def set_request_config(config: Dict[str, Any]) -> None:
     """Set request-specific configuration."""
-    _request_config.set(config)
+    if not isinstance(config, dict):
+        raise ValueError("Request config must be dictionary")
+    _request_config.set(config.copy())
 
 
 def clear_request_config() -> None:
@@ -351,36 +429,54 @@ def get_timestamp_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def hash_string(s: str) -> str:
-    """Hash a string (SHA256)."""
-    return hashlib.sha256(s.encode()).hexdigest()[:16]
+def hash_string(s: str, algorithm: str = "sha256") -> str:
+    """Hash a string with specified algorithm."""
+    if not isinstance(s, str):
+        s = str(s)
+    
+    if algorithm == "sha256":
+        return hashlib.sha256(s.encode()).hexdigest()[:16]
+    elif algorithm == "md5":
+        return hashlib.md5(s.encode()).hexdigest()[:16]
+    else:
+        raise ValueError(f"Unsupported algorithm: {algorithm}")
 
 
 def ensure_path(path: str) -> Path:
     """Ensure path exists, create if needed."""
+    if not isinstance(path, (str, Path)):
+        raise ValueError("Path must be string or Path object")
+    
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def load_json_config(path: str) -> Dict[str, Any]:
-    """Load JSON configuration file."""
+    """Load JSON configuration file safely."""
     try:
-        with open(path, 'r') as f:
+        p = Path(path)
+        if not p.exists():
+            logger.warning(f"Config file not found: {path}")
+            return {}
+        
+        with open(p, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except FileNotFoundError:
-        logger.warning(f"Config file not found: {path}")
-        return {}
     except json.JSONDecodeError as e:
         raise ConfigError(f"Invalid JSON in {path}: {e}")
+    except OSError as e:
+        raise ConfigError(f"Cannot read config file {path}: {e}")
 
 
 def save_json_config(data: Dict[str, Any], path: str) -> None:
-    """Save configuration to JSON file."""
-    ensure_path(path)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2, default=str)
-    logger.info(f"Config saved: {path}")
+    """Save configuration to JSON file safely."""
+    try:
+        p = ensure_path(path)
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+        logger.info(f"Config saved: {path}")
+    except (OSError, TypeError) as e:
+        raise ConfigError(f"Cannot save config to {path}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -388,24 +484,38 @@ def save_json_config(data: Dict[str, Any], path: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def validate_dataframe(
-    df: pd.DataFrame,
-    required_columns: List[str] = None,
+    df: Optional[pd.DataFrame],
+    required_columns: Optional[List[str]] = None,
     min_rows: int = 10
 ) -> Tuple[bool, List[str]]:
     """Validate DataFrame integrity."""
     errors = []
     
-    if df is None or df.empty:
+    if df is None:
+        errors.append("DataFrame is None")
+        return False, errors
+    
+    if not isinstance(df, pd.DataFrame):
+        errors.append("Object is not a pandas DataFrame")
+        return False, errors
+    
+    if df.empty:
         errors.append("DataFrame is empty")
         return False, errors
     
     if len(df) < min_rows:
-        errors.append(f"DataFrame has {len(df)} rows, need {min_rows}")
+        errors.append(f"DataFrame has {len(df)} rows, need at least {min_rows}")
     
     if required_columns:
         missing = [c for c in required_columns if c not in df.columns]
         if missing:
             errors.append(f"Missing columns: {missing}")
+    
+    # Check for NaN in critical columns
+    if required_columns:
+        for col in required_columns:
+            if col in df.columns and df[col].isna().any():
+                errors.append(f"Column '{col}' contains NaN values")
     
     return len(errors) == 0, errors
 
@@ -417,13 +527,17 @@ def validate_numeric_columns(
     """Validate that columns are numeric."""
     errors = []
     
+    if not isinstance(df, pd.DataFrame):
+        errors.append("Object is not a pandas DataFrame")
+        return False, errors
+    
     for col in columns:
         if col not in df.columns:
             errors.append(f"Column not found: {col}")
             continue
         
         if not pd.api.types.is_numeric_dtype(df[col]):
-            errors.append(f"Column not numeric: {col}")
+            errors.append(f"Column '{col}' is not numeric")
     
     return len(errors) == 0, errors
 
@@ -433,6 +547,7 @@ def validate_numeric_columns(
 # ═══════════════════════════════════════════════════════════════════════════
 
 _feature_registry = {}
+_registry_lock = Lock()
 
 
 def register_feature(
@@ -442,25 +557,35 @@ def register_feature(
     lookback: int = 1
 ) -> None:
     """Register a feature in global registry."""
-    _feature_registry[name] = {
-        "category": category,
-        "requires_shift": requires_shift,
-        "lookback": lookback,
-        "registered_at": get_timestamp_utc()
-    }
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Feature name must be non-empty string")
+    if not isinstance(category, str):
+        raise ValueError("Category must be string")
+    if not isinstance(lookback, int) or lookback < 1:
+        raise ValueError("Lookback must be positive integer")
+    
+    with _registry_lock:
+        _feature_registry[name] = {
+            "category": category,
+            "requires_shift": bool(requires_shift),
+            "lookback": lookback,
+            "registered_at": get_timestamp_utc()
+        }
 
 
 def get_feature_registry() -> Dict[str, Dict[str, Any]]:
-    """Get all registered features."""
-    return _feature_registry.copy()
+    """Get all registered features (thread-safe)."""
+    with _registry_lock:
+        return {k: v.copy() for k, v in _feature_registry.items()}
 
 
 def get_features_by_category(category: str) -> List[str]:
     """Get all features in a category."""
-    return [
-        name for name, meta in _feature_registry.items()
-        if meta.get("category") == category
-    ]
+    with _registry_lock:
+        return [
+            name for name, meta in _feature_registry.items()
+            if meta.get("category") == category
+        ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -482,31 +607,51 @@ class SystemHealth:
         return {
             "status": self.status,
             "uptime_hours": self.uptime_hours,
-            "last_check": self.last_check.isoformat(),
+            "last_check": self.last_check.isoformat() if self.last_check else None,
             "error_count": self.error_count,
             "warning_count": self.warning_count,
-            "details": self.details
+            "details": self.details.copy()
         }
 
 
 _system_health = SystemHealth()
+_health_lock = Lock()
 
 
 def get_system_health() -> SystemHealth:
     """Get current system health status."""
-    return _system_health
+    with _health_lock:
+        return SystemHealth(
+            status=_system_health.status,
+            uptime_hours=_system_health.uptime_hours,
+            last_check=_system_health.last_check,
+            error_count=_system_health.error_count,
+            warning_count=_system_health.warning_count,
+            details=_system_health.details.copy()
+        )
 
 
-def update_system_health(status: str, error: Optional[Exception] = None) -> None:
+def update_system_health(
+    status: str, 
+    error: Optional[Exception] = None,
+    details: Optional[Dict[str, Any]] = None
+) -> None:
     """Update system health status."""
-    _system_health.status = status
-    _system_health.last_check = get_timestamp_utc()
+    if status not in ("healthy", "degraded", "critical"):
+        raise ValueError(f"Invalid status: {status}")
     
-    if error:
-        _system_health.error_count += 1
-        logger.error(f"System error: {error}")
-    
-    logger.info(f"System health: {status}")
+    with _health_lock:
+        _system_health.status = status
+        _system_health.last_check = get_timestamp_utc()
+        
+        if error:
+            _system_health.error_count += 1
+            logger.error(f"System error: {error}")
+        
+        if details:
+            _system_health.details.update(details)
+        
+        logger.info(f"System health: {status}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -518,16 +663,59 @@ def initialize_system(config: Optional[SystemConfig] = None) -> None:
     if config is None:
         config = SystemConfig()
     
-    set_global_config(config)
-    logger.info(f"System initialized: {config.symbol} on {config.market_type}")
-    update_system_health("healthy")
+    try:
+        set_global_config(config)
+        logger.info(f"System initialized: {config.symbol} on {config.market_type}")
+        update_system_health("healthy")
+    except Exception as e:
+        logger.error(f"Failed to initialize system: {e}")
+        raise
 
 
 def shutdown_system() -> None:
     """Gracefully shutdown system."""
-    clear_request_config()
-    get_global_state().clear_cache()
-    logger.info("System shutdown complete")
+    try:
+        clear_request_config()
+        get_global_state().clear_cache()
+        logger.info("System shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITIES FOR TIME & CONVERSION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def timeframe_to_minutes(tf: Union[str, TimeFrame]) -> int:
+    """Convert timeframe to minutes."""
+    if isinstance(tf, TimeFrame):
+        tf = tf.value
+    
+    timeframe_map = {
+        "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "4h": 240, "1d": 1440, "1w": 10080
+    }
+    
+    if tf not in timeframe_map:
+        raise ValueError(f"Unknown timeframe: {tf}")
+    
+    return timeframe_map[tf]
+
+
+def minutes_to_timeframe(minutes: int) -> str:
+    """Convert minutes to timeframe string."""
+    if not isinstance(minutes, int) or minutes < 1:
+        raise ValueError("Minutes must be positive integer")
+    
+    minutes_map = {
+        1: "1m", 5: "5m", 15: "15m", 30: "30m",
+        60: "1h", 240: "4h", 1440: "1d", 10080: "1w"
+    }
+    
+    if minutes not in minutes_map:
+        raise ValueError(f"No timeframe for {minutes} minutes")
+    
+    return minutes_map[minutes]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -543,7 +731,7 @@ __all__ = [
     
     # Exceptions
     'TradingSystemError', 'ConfigError', 'DataError', 'FeatureError',
-    'ModelError', 'ExecutionError', 'LiveTradingError',
+    'ModelError', 'ExecutionError', 'StrategyError', 'RiskError', 'LiveTradingError',
     
     # Functions
     'get_global_state', 'get_global_config', 'set_global_config',
@@ -554,6 +742,7 @@ __all__ = [
     'validate_dataframe', 'validate_numeric_columns',
     'register_feature', 'get_feature_registry', 'get_features_by_category',
     'get_system_health', 'update_system_health',
+    'timeframe_to_minutes', 'minutes_to_timeframe',
     
     # Constants
     'HORIZONS', '_CLIP_ZSCORE', '_CLIP_RATIO', 'DATA_PATH_CONFIG',
@@ -562,4 +751,3 @@ __all__ = [
     # Logging
     'logger',
 ]
-

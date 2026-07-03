@@ -1,305 +1,457 @@
 """
-تست‌های Core Module
-شامل تست‌های Config، Logger و BaseClass
+Test suite for core.py bug fixes and improvements.
+Run: pytest test_core_fixes.py -v
 """
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime
+import sys
+import json
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+# Mock imports for testing
+try:
+    from trading_ai_system.core import core
+except ImportError:
+    # Use local core.py for testing
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("core", "core.py")
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
 
 
-class TestCoreModuleConfig:
-    """تست‌های کلاس Configuration"""
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #1: from_dict() - Mutable Default Argument
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_config_from_dict_doesnt_modify_original():
+    """Test that from_dict() doesn't modify the original dict."""
+    original_dict = {
+        'symbol': 'EURUSD',
+        'market_type': 'spot',
+        'base_timeframe': '1h'
+    }
+    original_copy = original_dict.copy()
     
-    def test_config_creation_with_defaults(self):
-        """تست ایجاد Config با مقادیر پیشفرض"""
-        # این تست فرض می‌کند کلاس Config در core موجود است
-        # config = Config()
-        # assert config.api_key is not None
-        # assert config.account_type == 'demo'
-        pass
+    config = core.SystemConfig.from_dict(original_dict)
     
-    def test_config_creation_with_custom_values(self, config_dict):
-        """تست ایجاد Config با مقادیر سفارشی"""
-        # config = Config(**config_dict)
-        # assert config.api_key == 'test_key_123'
-        # assert config.account_type == 'demo'
-        pass
-    
-    def test_config_validation(self):
-        """تست اعتبارسنجی پارامترهای Config"""
-        # با مقادیر نادرست باید خطا رفع کند
-        # with pytest.raises(ValueError):
-        #     config = Config(leverage=-1)
-        pass
-    
-    def test_config_save_to_file(self, tmp_path):
-        """تست ذخیره‌سازی Config در فایل"""
-        # config = Config(api_key='test')
-        # file_path = tmp_path / "config.json"
-        # config.save(str(file_path))
-        # assert file_path.exists()
-        pass
-    
-    def test_config_load_from_file(self, tmp_path):
-        """تست بارگذاری Config از فایل"""
-        # config_file = tmp_path / "config.json"
-        # config_file.write_text('{"api_key": "test"}')
-        # loaded = Config.load(str(config_file))
-        # assert loaded.api_key == 'test'
-        pass
-    
-    def test_config_update(self, config_dict):
-        """تست بروزرسانی پارامترهای Config"""
-        # config = Config(**config_dict)
-        # new_config = {'leverage': 20}
-        # config.update(new_config)
-        # assert config.leverage == 20
-        pass
+    # Original dict should be unchanged
+    assert original_dict == original_copy
+    # Config should be properly created
+    assert config.symbol == 'EURUSD'
+    assert config.market_type == core.MarketType.SPOT
 
 
-class TestCoreLogger:
-    """تست‌های Logger"""
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #3 & #4: Thread-Safe GlobalState and Cache
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_global_state_thread_safe_creation():
+    """Test that GlobalState is created safely in multi-threaded context."""
+    states = []
     
-    def test_logger_initialization(self):
-        """تست مقدار دهی Logger"""
-        # from trading_ai_system.core import Logger
-        # logger = Logger(name='test')
-        # assert logger.name == 'test'
-        pass
+    def get_state():
+        state = core.get_global_state()
+        states.append(id(state))
     
-    def test_logger_debug_message(self, caplog):
-        """تست logging پیام Debug"""
-        # logger = Logger(name='test')
-        # logger.debug('Test message')
-        # assert 'Test message' in caplog.text
-        pass
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(lambda _: get_state(), range(100))
     
-    def test_logger_info_message(self, caplog):
-        """تست logging پیام Info"""
-        # logger = Logger(name='test')
-        # logger.info('Test info')
-        # assert 'Test info' in caplog.text
-        pass
-    
-    def test_logger_warning_message(self, caplog):
-        """تست logging پیام Warning"""
-        # logger = Logger(name='test')
-        # logger.warning('Test warning')
-        # assert 'Test warning' in caplog.text
-        pass
-    
-    def test_logger_error_message(self, caplog):
-        """تست logging پیام Error"""
-        # logger = Logger(name='test')
-        # logger.error('Test error')
-        # assert 'Test error' in caplog.text
-        pass
-    
-    def test_logger_file_output(self, tmp_path):
-        """تست نوشتن Log در فایل"""
-        # log_file = tmp_path / "test.log"
-        # logger = Logger(name='test', file=str(log_file))
-        # logger.info('Test')
-        # assert log_file.exists()
-        pass
-    
-    @pytest.mark.slow
-    def test_logger_performance(self, benchmark_timer):
-        """تست کارایی Logger"""
-        # logger = Logger(name='test')
-        # benchmark_timer.start()
-        # for i in range(10000):
-        #     logger.debug(f'Message {i}')
-        # benchmark_timer.stop()
-        # assert benchmark_timer.elapsed() < 5.0  # باید کمتر از 5 ثانیه
-        pass
+    # All should be the same singleton instance
+    assert len(set(states)) == 1
 
 
-class TestCoreExceptions:
-    """تست‌های Exception Handling"""
+def test_cache_thread_safe_operations():
+    """Test that cache operations are thread-safe."""
+    state = core.get_global_state()
+    results = []
     
-    def test_config_error_exception(self):
-        """تست ConfigError Exception"""
-        # from trading_ai_system.core import ConfigError
-        # with pytest.raises(ConfigError):
-        #     raise ConfigError("Invalid config")
-        pass
+    def set_and_get(i):
+        state.set_cached(f"key_{i}", f"value_{i}")
+        return state.get_cached(f"key_{i}")
     
-    def test_data_error_exception(self):
-        """تست DataError Exception"""
-        # from trading_ai_system.core import DataError
-        # with pytest.raises(DataError):
-        #     raise DataError("Invalid data")
-        pass
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(set_and_get, range(50)))
     
-    def test_trading_error_exception(self):
-        """تست TradingError Exception"""
-        # from trading_ai_system.core import TradingError
-        # with pytest.raises(TradingError):
-        #     raise TradingError("Trading failed")
-        pass
+    # All operations should succeed
+    assert len(results) == 50
+    assert all(r is not None for r in results)
 
 
-class TestCoreUtilities:
-    """تست‌های Utility Functions"""
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #5: Config Validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_invalid_config_rejected():
+    """Test that invalid configurations are rejected."""
+    # Test invalid commission
+    invalid_config = core.SystemConfig(commission_per_side=2.0)
+    valid, errors = invalid_config.validate()
+    assert not valid
+    assert any('commission' in e for e in errors)
     
-    def test_validate_symbol(self):
-        """تست اعتبارسنجی Symbol"""
-        # from trading_ai_system.core import validate_symbol
-        # assert validate_symbol('EURUSD') == True
-        # assert validate_symbol('INVALID') == False
-        pass
+    # Test invalid max_drawdown
+    invalid_config = core.SystemConfig(max_drawdown=1.5)
+    valid, errors = invalid_config.validate()
+    assert not valid
+    assert any('max_drawdown' in e for e in errors)
     
-    def test_format_number(self):
-        """تست فرمت‌دهی اعداد"""
-        # from trading_ai_system.core import format_number
-        # assert format_number(1.123456, 2) == '1.12'
-        # assert format_number(1.127, 2) == '1.13'
-        pass
-    
-    def test_timestamp_conversion(self):
-        """تست تبدیل Timestamp"""
-        # from trading_ai_system.core import timestamp_to_datetime
-        # result = timestamp_to_datetime(1609459200)
-        # assert result.year == 2021
-        pass
-    
-    @pytest.mark.performance
-    def test_utility_performance(self, benchmark_timer):
-        """تست کارایی Utility Functions"""
-        # from trading_ai_system.core import validate_symbol
-        # benchmark_timer.start()
-        # for i in range(100000):
-        #     validate_symbol('EURUSD')
-        # benchmark_timer.stop()
-        # assert benchmark_timer.elapsed() < 1.0
-        pass
+    # Test valid config
+    valid_config = core.SystemConfig()
+    valid, errors = valid_config.validate()
+    assert valid
+    assert len(errors) == 0
 
 
-class TestCoreIntegration:
-    """تست‌های یکپارچگی Core"""
+def test_set_config_validates():
+    """Test that set_global_config() validates config."""
+    state = core.get_global_state()
     
-    @pytest.mark.integration
-    def test_full_core_initialization(self, config_dict):
-        """تست مقدار دهی کامل Core"""
-        # from trading_ai_system.core import TradingCore
-        # core = TradingCore(config=config_dict)
-        # assert core.is_initialized() == True
-        # assert core.get_config() == config_dict
-        pass
+    # Should raise error for invalid config
+    invalid_config = core.SystemConfig(commission_per_side=2.0)
+    with pytest.raises(core.ConfigError):
+        state.set_config(invalid_config)
     
-    @pytest.mark.integration
-    def test_core_with_logger(self, config_dict, logger_config):
-        """تست Core با Logger"""
-        # from trading_ai_system.core import TradingCore, Logger
-        # logger = Logger(**logger_config)
-        # core = TradingCore(config=config_dict, logger=logger)
-        # assert core.logger is not None
-        pass
+    # Should accept valid config
+    valid_config = core.SystemConfig(symbol="BTCUSD")
+    state.set_config(valid_config)
+    assert state.get_config().symbol == "BTCUSD"
 
 
-class TestCoreThread:
-    """تست‌های Threading در Core"""
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #6: Feature Registry Thread-Safe
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_feature_registry_thread_safe():
+    """Test that feature registry operations are thread-safe."""
+    errors = []
     
-    @pytest.mark.slow
-    def test_async_operation(self):
-        """تست عملیات Async"""
-        # import asyncio
-        # from trading_ai_system.core import AsyncCore
-        # async def async_test():
-        #     core = AsyncCore()
-        #     result = await core.async_operation()
-        #     return result
-        # result = asyncio.run(async_test())
-        # assert result is not None
-        pass
+    def register_and_get(i):
+        try:
+            core.register_feature(
+                f"feature_{i}",
+                category="technical",
+                lookback=i + 1
+            )
+            registry = core.get_feature_registry()
+            assert f"feature_{i}" in registry
+        except Exception as e:
+            errors.append(e)
+    
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(register_and_get, range(50))
+    
+    assert len(errors) == 0
+    registry = core.get_feature_registry()
+    assert len(registry) >= 50
 
 
-class TestCoreMemory:
-    """تست‌های Memory Management"""
+def test_register_feature_validates_input():
+    """Test that register_feature() validates input."""
+    # Invalid feature name
+    with pytest.raises(ValueError):
+        core.register_feature("")
     
-    def test_memory_cleanup(self):
-        """تست پاک‌کردن حافظه"""
-        # from trading_ai_system.core import TradingCore
-        # core = TradingCore()
-        # core.cleanup()
-        # # بررسی اینکه حافظه آزاد شده است
-        pass
+    with pytest.raises(ValueError):
+        core.register_feature("   ")  # Whitespace only
     
-    @pytest.mark.performance
-    def test_memory_usage(self):
-        """تست استفاده از حافظه"""
-        # import sys
-        # from trading_ai_system.core import TradingCore
-        # core = TradingCore()
-        # size = sys.getsizeof(core)
-        # assert size < 10000  # باید کمتر از 10KB باشد
-        pass
+    # Invalid lookback
+    with pytest.raises(ValueError):
+        core.register_feature("test", lookback=0)
+    
+    with pytest.raises(ValueError):
+        core.register_feature("test", lookback=-1)
+    
+    # Valid registration
+    core.register_feature("valid_feature", lookback=14)
+    registry = core.get_feature_registry()
+    assert "valid_feature" in registry
 
 
-class TestCoreContext:
-    """تست‌های Context Manager"""
-    
-    def test_context_manager(self):
-        """تست Context Manager"""
-        # from trading_ai_system.core import TradingCore
-        # with TradingCore() as core:
-        #     assert core is not None
-        # # بعد از خروج باید cleanup شود
-        pass
-    
-    def test_context_exception_handling(self):
-        """تست مدیریت Exception در Context"""
-        # from trading_ai_system.core import TradingCore
-        # try:
-        #     with TradingCore() as core:
-        #         raise ValueError("Test error")
-        # except ValueError:
-        #     pass  # باید catch شود
-        pass
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #8: JSON I/O Safety
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_json_config_encoding():
+    """Test that JSON config uses proper encoding."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.json"
+        
+        # Save config
+        data = {"symbol": "EURUSD", "test": "value"}
+        core.save_json_config(data, str(config_path))
+        
+        # Verify file exists and contains valid JSON
+        assert config_path.exists()
+        
+        # Load config
+        loaded = core.load_json_config(str(config_path))
+        assert loaded == data
 
 
-class TestCoreValidation:
-    """تست‌های Validation"""
-    
-    @pytest.mark.parametrize("symbol", ['EURUSD', 'GBPUSD', 'USDJPY'])
-    def test_multiple_symbols(self, symbol):
-        """تست پشتیبانی از نماد‌های متعدد"""
-        # from trading_ai_system.core import validate_symbol
-        # assert validate_symbol(symbol) == True
-        pass
-    
-    @pytest.mark.parametrize("invalid_symbol", ['INVALID', 'XYZ', ''])
-    def test_invalid_symbols(self, invalid_symbol):
-        """تست نماد‌های نادرست"""
-        # from trading_ai_system.core import validate_symbol
-        # assert validate_symbol(invalid_symbol) == False
-        pass
+def test_json_config_error_handling():
+    """Test error handling in JSON operations."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Test loading non-existent file
+        result = core.load_json_config(str(Path(tmpdir) / "nonexistent.json"))
+        assert result == {}
+        
+        # Test loading invalid JSON
+        invalid_path = Path(tmpdir) / "invalid.json"
+        invalid_path.write_text("{invalid json")
+        
+        with pytest.raises(core.ConfigError):
+            core.load_json_config(str(invalid_path))
 
 
-class TestCoreState:
-    """تست‌های State Management"""
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #9: get_request_config() Returns Copy
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_request_config_returns_copy():
+    """Test that get_request_config() returns a copy."""
+    config1 = {"key": "value"}
+    core.set_request_config(config1)
     
-    def test_state_initialization(self):
-        """تست اولیه State"""
-        # from trading_ai_system.core import StateManager
-        # state = StateManager()
-        # assert state.is_ready() == True
-        pass
+    # Get config
+    config2 = core.get_request_config()
     
-    def test_state_transitions(self):
-        """تست تغییر States"""
-        # from trading_ai_system.core import StateManager
-        # state = StateManager()
-        # state.set_state('RUNNING')
-        # assert state.get_state() == 'RUNNING'
-        pass
+    # Modify returned config
+    config2["key"] = "modified"
+    config2["new_key"] = "new_value"
     
-    def test_invalid_state_transition(self):
-        """تست تغییر State نادرست"""
-        # from trading_ai_system.core import StateManager, StateError
-        # state = StateManager()
-        # with pytest.raises(StateError):
-        #     state.set_state('INVALID')
-        pass
+    # Original in system should be unchanged
+    config3 = core.get_request_config()
+    assert config3["key"] == "value"
+    assert "new_key" not in config3
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIX #10 & #11: Registry and Health Return Copies
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_feature_registry_returns_copy():
+    """Test that get_feature_registry() returns a copy."""
+    core.register_feature("test_feature", category="test")
+    
+    registry1 = core.get_feature_registry()
+    registry1["test_feature"]["category"] = "modified"
+    registry1["fake_feature"] = {"data": "fake"}
+    
+    # Original should be unchanged
+    registry2 = core.get_feature_registry()
+    assert registry2["test_feature"]["category"] == "test"
+    assert "fake_feature" not in registry2
+
+
+def test_system_health_returns_copy():
+    """Test that get_system_health() returns a copy."""
+    core.update_system_health("degraded", details={"reason": "test"})
+    
+    health1 = core.get_system_health()
+    health1.details["reason"] = "modified"
+    health1.details["new_key"] = "new_value"
+    
+    # Original should be unchanged
+    health2 = core.get_system_health()
+    assert health2.details.get("reason") == "test"
+    assert "new_key" not in health2.details
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE: SystemConfig.validate()
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_config_validate_method():
+    """Test SystemConfig.validate() method."""
+    # Valid config
+    config = core.SystemConfig()
+    valid, errors = config.validate()
+    assert valid
+    assert len(errors) == 0
+    
+    # Invalid: empty symbol
+    config = core.SystemConfig(symbol="")
+    valid, errors = config.validate()
+    assert not valid
+    assert any("symbol" in e for e in errors)
+    
+    # Invalid: test_size out of range
+    config = core.SystemConfig(test_size=1.5)
+    valid, errors = config.validate()
+    assert not valid
+    assert any("test_size" in e for e in errors)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE: Timeframe Conversion Utils
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_timeframe_to_minutes():
+    """Test timeframe_to_minutes() function."""
+    assert core.timeframe_to_minutes("1m") == 1
+    assert core.timeframe_to_minutes("5m") == 5
+    assert core.timeframe_to_minutes("15m") == 15
+    assert core.timeframe_to_minutes("1h") == 60
+    assert core.timeframe_to_minutes("4h") == 240
+    assert core.timeframe_to_minutes("1d") == 1440
+    assert core.timeframe_to_minutes("1w") == 10080
+    
+    # Test with TimeFrame enum
+    assert core.timeframe_to_minutes(core.TimeFrame.H1) == 60
+    
+    # Test invalid
+    with pytest.raises(ValueError):
+        core.timeframe_to_minutes("invalid")
+
+
+def test_minutes_to_timeframe():
+    """Test minutes_to_timeframe() function."""
+    assert core.minutes_to_timeframe(1) == "1m"
+    assert core.minutes_to_timeframe(5) == "5m"
+    assert core.minutes_to_timeframe(60) == "1h"
+    assert core.minutes_to_timeframe(240) == "4h"
+    assert core.minutes_to_timeframe(1440) == "1d"
+    
+    # Test invalid
+    with pytest.raises(ValueError):
+        core.minutes_to_timeframe(0)
+    
+    with pytest.raises(ValueError):
+        core.minutes_to_timeframe(999)
+
+
+def test_timeframe_round_trip():
+    """Test round-trip conversion between timeframes and minutes."""
+    for tf in ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]:
+        minutes = core.timeframe_to_minutes(tf)
+        tf_back = core.minutes_to_timeframe(minutes)
+        assert tf_back == tf
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE: Improved Data Validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_validate_dataframe_type_check():
+    """Test that validate_dataframe() checks DataFrame type."""
+    import pandas as pd
+    
+    # Test with None
+    valid, errors = core.validate_dataframe(None)
+    assert not valid
+    assert any("None" in e for e in errors)
+    
+    # Test with non-DataFrame
+    valid, errors = core.validate_dataframe([1, 2, 3])
+    assert not valid
+    assert any("not a pandas DataFrame" in e for e in errors)
+    
+    # Test with valid DataFrame
+    df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+    valid, errors = core.validate_dataframe(df)
+    assert valid
+    assert len(errors) == 0
+
+
+def test_validate_dataframe_nan_check():
+    """Test that validate_dataframe() checks for NaN values."""
+    import pandas as pd
+    import numpy as np
+    
+    # DataFrame with NaN in required column
+    df = pd.DataFrame({
+        "open": [1, 2, np.nan],
+        "close": [2, 3, 4]
+    })
+    
+    valid, errors = core.validate_dataframe(
+        df,
+        required_columns=["open", "close"]
+    )
+    assert not valid
+    assert any("NaN" in e for e in errors)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QUALITY: Exception Classes
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_exception_hierarchy():
+    """Test that all exception classes exist and inherit correctly."""
+    exceptions = [
+        core.StrategyError,
+        core.RiskError,
+        core.ConfigError,
+        core.DataError,
+        core.ModelError,
+    ]
+    
+    for exc_class in exceptions:
+        assert issubclass(exc_class, core.TradingSystemError)
+        # Test instantiation
+        exc = exc_class("test message")
+        assert str(exc) == "test message"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QUALITY: hash_string() Algorithm Selection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_hash_string_algorithms():
+    """Test hash_string() with different algorithms."""
+    test_str = "test_data"
+    
+    # SHA256 (default)
+    hash1 = core.hash_string(test_str)
+    assert len(hash1) == 16
+    
+    hash2 = core.hash_string(test_str, algorithm="sha256")
+    assert hash1 == hash2
+    
+    # MD5
+    hash3 = core.hash_string(test_str, algorithm="md5")
+    assert len(hash3) == 16
+    assert hash3 != hash1  # Different algorithms
+    
+    # Invalid algorithm
+    with pytest.raises(ValueError):
+        core.hash_string(test_str, algorithm="invalid")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QUALITY: Error Handling in System Lifecycle
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_initialize_system_error_handling():
+    """Test that initialize_system() handles errors properly."""
+    # Valid config should work
+    config = core.SystemConfig(symbol="TEST")
+    core.initialize_system(config)
+    assert core.get_global_config().symbol == "TEST"
+    
+    # Invalid config should raise error
+    invalid_config = core.SystemConfig(commission_per_side=2.0)
+    with pytest.raises(core.ConfigError):
+        core.initialize_system(invalid_config)
+
+
+def test_shutdown_system():
+    """Test system shutdown."""
+    core.initialize_system()
+    core.set_request_config({"test": "data"})
+    
+    core.shutdown_system()
+    
+    # Request config should be cleared
+    config = core.get_request_config()
+    assert config == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RUN TESTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])
