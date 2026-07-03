@@ -5,13 +5,13 @@ Feature engineering, technical indicators, and pattern detection.
 
 import sys
 import logging
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 from dataclasses import dataclass, field
+from threading import Lock
 
 import numpy as np
 import pandas as pd
 
-# ✅ Fixed: Proper import paths
 try:
     from trading_ai_system.core import (
         logger, TradingSystemError, FeatureError,
@@ -19,7 +19,6 @@ try:
         HORIZONS, HORIZON_MIN_BARS, BARS_PER_DAY_BY_TF
     )
 except ImportError:
-    # Fallback for direct execution
     import logging
     logger = logging.getLogger(__name__)
     
@@ -40,27 +39,15 @@ except ImportError:
     BARS_PER_DAY_BY_TF = {}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# EXCEPTION CLASSES
-# ═══════════════════════════════════════════════════════════════════════════
-
 class FeatureEngineeringError(FeatureError):
-    """Feature engineering error."""
     pass
-
 
 class FeatureRegistrationError(FeatureError):
-    """Feature registration error."""
     pass
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FEATURE REGISTRY
-# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class FeatureMetadata:
-    """Metadata for a feature."""
     name: str
     category: str
     requires_shift: bool = False
@@ -69,7 +56,6 @@ class FeatureMetadata:
     min_bars: int = 1
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "name": self.name,
             "category": self.category,
@@ -80,20 +66,20 @@ class FeatureMetadata:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS - CORE CALCULATIONS
-# ═══════════════════════════════════════════════════════════════════════════
-
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    """Calculate Relative Strength Index (RSI)."""
+    if not isinstance(close, pd.Series) or len(close) < period:
+        return pd.Series(np.nan, index=close.index if isinstance(close, pd.Series) else None)
+    
+    close = close.astype(float)
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    
+    gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=1).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=1).mean()
     
     rs = gain / (loss + 1e-10)
     rsi = 100 - (100 / (1 + rs))
     
-    return rsi
+    return rsi.fillna(50.0)
 
 
 def compute_macd(
@@ -102,10 +88,11 @@ def compute_macd(
     slow: int = 26,
     signal: int = 9
 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Calculate MACD (Moving Average Convergence Divergence).
+    if not isinstance(close, pd.Series) or len(close) < slow:
+        idx = close.index if isinstance(close, pd.Series) else None
+        return pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx)
     
-    Returns: (macd, signal, histogram)
-    """
+    close = close.astype(float)
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     
@@ -121,12 +108,14 @@ def compute_bollinger_bands(
     period: int = 20,
     num_std: float = 2.0
 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Calculate Bollinger Bands.
+    if not isinstance(close, pd.Series) or len(close) < period:
+        idx = close.index if isinstance(close, pd.Series) else None
+        return pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx)
     
-    Returns: (upper, middle, lower)
-    """
-    middle = close.rolling(window=period).mean()
-    std = close.rolling(window=period).std()
+    close = close.astype(float)
+    middle = close.rolling(window=period, min_periods=1).mean()
+    std = close.rolling(window=period, min_periods=1).std()
+    std = std.fillna(0)
     
     upper = middle + (std * num_std)
     lower = middle - (std * num_std)
@@ -140,15 +129,24 @@ def compute_atr(
     close: pd.Series,
     period: int = 14
 ) -> pd.Series:
-    """Calculate Average True Range (ATR)."""
+    if not isinstance(high, pd.Series) or not isinstance(low, pd.Series) or not isinstance(close, pd.Series):
+        return pd.Series(np.nan, index=high.index if isinstance(high, pd.Series) else None)
+    
+    if len(high) < period:
+        return pd.Series(np.nan, index=high.index)
+    
+    high = high.astype(float)
+    low = low.astype(float)
+    close = close.astype(float)
+    
     tr1 = high - low
-    tr2 = abs(high - close.shift())
-    tr3 = abs(low - close.shift())
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
     
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
+    atr = tr.rolling(window=period, min_periods=1).mean()
     
-    return atr
+    return atr.fillna(tr.mean()) if tr.mean() > 0 else atr
 
 
 def compute_stochastic(
@@ -159,332 +157,363 @@ def compute_stochastic(
     smooth_k: int = 3,
     smooth_d: int = 3
 ) -> Tuple[pd.Series, pd.Series]:
-    """Calculate Stochastic Oscillator.
+    if not isinstance(high, pd.Series) or not isinstance(low, pd.Series) or not isinstance(close, pd.Series):
+        idx = high.index if isinstance(high, pd.Series) else None
+        return pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx)
     
-    Returns: (K%, D%)
-    """
-    lowest_low = low.rolling(window=period).min()
-    highest_high = high.rolling(window=period).max()
+    if len(high) < period:
+        idx = high.index
+        return pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx)
     
-    k_percent = 100 * (close - lowest_low) / (highest_high - lowest_low + 1e-10)
-    k_smooth = k_percent.rolling(window=smooth_k).mean()
-    d_smooth = k_smooth.rolling(window=smooth_d).mean()
+    high = high.astype(float)
+    low = low.astype(float)
+    close = close.astype(float)
     
-    return k_smooth, d_smooth
+    lowest_low = low.rolling(window=period, min_periods=1).min()
+    highest_high = high.rolling(window=period, min_periods=1).max()
+    
+    range_val = highest_high - lowest_low
+    range_val = range_val.replace(0, 1e-10)
+    
+    k_percent = 100 * (close - lowest_low) / (range_val + 1e-10)
+    k_smooth = k_percent.rolling(window=smooth_k, min_periods=1).mean()
+    d_smooth = k_smooth.rolling(window=smooth_d, min_periods=1).mean()
+    
+    return k_smooth.fillna(50.0), d_smooth.fillna(50.0)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# PRICE ACTION PATTERNS
-# ═══════════════════════════════════════════════════════════════════════════
 
 def detect_engulfing(df: pd.DataFrame) -> pd.DataFrame:
-    """v79: Detect bullish and bearish engulfing patterns (no internal shift).
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
     
-    Engulfing patterns are already correctly positioned without double-shift.
-    """
-    prev_open = df["open"].shift(1)
-    prev_close = df["close"].shift(1)
+    if not all(c in df.columns for c in ['open', 'close', 'high', 'low']):
+        return df
+    
+    df = df.copy()
+    df_work = df[['open', 'close', 'high', 'low']].astype(float)
+    
+    prev_open = df_work["open"].shift(1)
+    prev_close = df_work["close"].shift(1)
     prev_body = (prev_close - prev_open).abs()
-    curr_body = (df["close"] - df["open"]).abs()
+    curr_body = (df_work["close"] - df_work["open"]).abs()
     
-    # Bullish engulfing
     bullish = (
         (prev_close < prev_open) &
-        (df["close"] > df["open"]) &
-        (df["open"] <= prev_close) &
-        (df["close"] >= prev_open) &
+        (df_work["close"] > df_work["open"]) &
+        (df_work["open"] <= prev_close) &
+        (df_work["close"] >= prev_open) &
         (curr_body > prev_body)
-    ).astype(int)
+    ).astype(int).fillna(0)
     
-    # Bearish engulfing
     bearish = (
         (prev_close > prev_open) &
-        (df["close"] < df["open"]) &
-        (df["open"] >= prev_close) &
-        (df["close"] <= prev_open) &
+        (df_work["close"] < df_work["open"]) &
+        (df_work["open"] >= prev_close) &
+        (df_work["close"] <= prev_open) &
         (curr_body > prev_body)
-    ).astype(int)
+    ).astype(int).fillna(0)
     
     df["engulfing_bullish"] = bullish
     df["engulfing_bearish"] = bearish
     
-    register_feature("engulfing_bullish", category="price_action", requires_shift=False)
-    register_feature("engulfing_bearish", category="price_action", requires_shift=False)
+    try:
+        register_feature("engulfing_bullish", category="price_action", requires_shift=False)
+        register_feature("engulfing_bearish", category="price_action", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to register engulfing features: {e}")
     
     return df
 
 
 def detect_doji(df: pd.DataFrame, threshold: float = 0.1) -> pd.DataFrame:
-    """v79: Detect doji patterns (no internal shift)."""
-    body = (df["close"] - df["open"]).abs()
-    range_ = df["high"] - df["low"]
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
     
-    df["is_doji"] = ((body / (range_ + 1e-10)) < threshold).astype(int)
+    if not all(c in df.columns for c in ['open', 'close', 'high', 'low']):
+        return df
+    
+    if threshold <= 0 or threshold > 1:
+        threshold = 0.1
+    
+    df = df.copy()
+    df_work = df[['open', 'close', 'high', 'low']].astype(float)
+    
+    body = (df_work["close"] - df_work["open"]).abs()
+    range_ = df_work["high"] - df_work["low"]
+    
+    range_ = range_.replace(0, 1e-10)
+    
+    df["is_doji"] = ((body / (range_ + 1e-10)) < threshold).astype(int).fillna(0)
     df["doji_star"] = (
-        df["is_doji"] &
-        (df["low"] < df["low"].shift(1))
-    ).astype(int)
+        (df["is_doji"] == 1) &
+        (df_work["low"] < df_work["low"].shift(1))
+    ).astype(int).fillna(0)
     
-    register_feature("is_doji", category="price_action", requires_shift=False)
-    register_feature("doji_star", category="price_action", requires_shift=False)
+    try:
+        register_feature("is_doji", category="price_action", requires_shift=False)
+        register_feature("doji_star", category="price_action", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to register doji features: {e}")
     
     return df
 
 
 def detect_inside_bar(df: pd.DataFrame) -> pd.DataFrame:
-    """v79: Detect inside bar patterns (no double-shift)."""
-    prev_high = df["high"].shift(1)
-    prev_low = df["low"].shift(1)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    
+    if not all(c in df.columns for c in ['high', 'low', 'close']):
+        return df
+    
+    df = df.copy()
+    df_work = df[['high', 'low', 'close']].astype(float)
+    
+    prev_high = df_work["high"].shift(1)
+    prev_low = df_work["low"].shift(1)
     
     df["inside_bar"] = (
-        (df["high"] <= prev_high) &
-        (df["low"] >= prev_low)
-    ).astype(int)
+        (df_work["high"] <= prev_high) &
+        (df_work["low"] >= prev_low)
+    ).astype(int).fillna(0)
+    
+    inside_bar_prev = df["inside_bar"].shift(1).fillna(0)
     
     df["inside_bar_breakout_up"] = (
-        df["inside_bar"].shift(1).fillna(0) &
-        (df["close"] > prev_high)
-    ).astype(int)
+        (inside_bar_prev == 1) &
+        (df_work["close"] > prev_high)
+    ).astype(int).fillna(0)
     
     df["inside_bar_breakout_down"] = (
-        df["inside_bar"].shift(1).fillna(0) &
-        (df["close"] < prev_low)
-    ).astype(int)
+        (inside_bar_prev == 1) &
+        (df_work["close"] < prev_low)
+    ).astype(int).fillna(0)
     
-    register_feature("inside_bar", category="price_action", requires_shift=False)
-    register_feature("inside_bar_breakout_up", category="price_action", requires_shift=False)
-    register_feature("inside_bar_breakout_down", category="price_action", requires_shift=False)
+    try:
+        register_feature("inside_bar", category="price_action", requires_shift=False)
+        register_feature("inside_bar_breakout_up", category="price_action", requires_shift=False)
+        register_feature("inside_bar_breakout_down", category="price_action", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to register inside_bar features: {e}")
     
     return df
 
 
 def detect_three_bar_patterns(df: pd.DataFrame) -> pd.DataFrame:
-    """v79: Detect three bar reversal patterns (requires_shift=False)."""
-    bullish_1 = df["close"] > df["open"]
-    bullish_2 = df["close"].shift(1) > df["open"].shift(1)
-    bullish_3 = df["close"].shift(2) > df["open"].shift(2)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
     
-    higher_close_1 = df["close"] > df["close"].shift(1)
-    higher_close_2 = df["close"].shift(1) > df["close"].shift(2)
+    if not all(c in df.columns for c in ['open', 'close']):
+        return df
+    
+    df = df.copy()
+    df_work = df[['open', 'close']].astype(float)
+    
+    bullish_1 = df_work["close"] > df_work["open"]
+    bullish_2 = df_work["close"].shift(1) > df_work["open"].shift(1)
+    bullish_3 = df_work["close"].shift(2) > df_work["open"].shift(2)
+    
+    higher_close_1 = df_work["close"] > df_work["close"].shift(1)
+    higher_close_2 = df_work["close"].shift(1) > df_work["close"].shift(2)
     
     df["three_white_soldiers"] = (
         bullish_1 & bullish_2 & bullish_3 &
         higher_close_1 & higher_close_2
-    ).astype(int)
+    ).astype(int).fillna(0)
     
-    bearish_1 = df["close"] < df["open"]
-    bearish_2 = df["close"].shift(1) < df["open"].shift(1)
-    bearish_3 = df["close"].shift(2) < df["open"].shift(2)
+    bearish_1 = df_work["close"] < df_work["open"]
+    bearish_2 = df_work["close"].shift(1) < df_work["open"].shift(1)
+    bearish_3 = df_work["close"].shift(2) < df_work["open"].shift(2)
     
-    lower_close_1 = df["close"] < df["close"].shift(1)
-    lower_close_2 = df["close"].shift(1) < df["close"].shift(2)
+    lower_close_1 = df_work["close"] < df_work["close"].shift(1)
+    lower_close_2 = df_work["close"].shift(1) < df_work["close"].shift(2)
     
     df["three_black_crows"] = (
         bearish_1 & bearish_2 & bearish_3 &
         lower_close_1 & lower_close_2
-    ).astype(int)
+    ).astype(int).fillna(0)
     
-    register_feature("three_white_soldiers", category="price_action", requires_shift=False)
-    register_feature("three_black_crows", category="price_action", requires_shift=False)
+    try:
+        register_feature("three_white_soldiers", category="price_action", requires_shift=False)
+        register_feature("three_black_crows", category="price_action", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to register three_bar features: {e}")
     
     return df
 
 
 def detect_morning_evening_star(df: pd.DataFrame) -> pd.DataFrame:
-    """v79: Detect morning/evening star patterns (requires_shift=False)."""
-    body_1 = (df["close"].shift(2) - df["open"].shift(2)).abs()
-    body_2 = (df["close"].shift(1) - df["open"].shift(1)).abs()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
     
-    # Morning star (bullish)
+    if not all(c in df.columns for c in ['open', 'close']):
+        return df
+    
+    df = df.copy()
+    df_work = df[['open', 'close']].astype(float)
+    
+    body_1 = (df_work["close"].shift(2) - df_work["open"].shift(2)).abs()
+    body_2 = (df_work["close"].shift(1) - df_work["open"].shift(1)).abs()
+    
     df["morning_star"] = (
-        (df["close"].shift(2) < df["open"].shift(2)) &
+        (df_work["close"].shift(2) < df_work["open"].shift(2)) &
         (body_2 < body_1 * 0.3) &
-        (df["close"] > df["open"]) &
-        (df["close"] > (df["open"].shift(2) + df["close"].shift(2)) / 2)
-    ).astype(int)
+        (df_work["close"] > df_work["open"]) &
+        (df_work["close"] > (df_work["open"].shift(2) + df_work["close"].shift(2)) / 2)
+    ).astype(int).fillna(0)
     
-    # Evening star (bearish)
     df["evening_star"] = (
-        (df["close"].shift(2) > df["open"].shift(2)) &
+        (df_work["close"].shift(2) > df_work["open"].shift(2)) &
         (body_2 < body_1 * 0.3) &
-        (df["close"] < df["open"]) &
-        (df["close"] < (df["open"].shift(2) + df["close"].shift(2)) / 2)
-    ).astype(int)
+        (df_work["close"] < df_work["open"]) &
+        (df_work["close"] < (df_work["open"].shift(2) + df_work["close"].shift(2)) / 2)
+    ).astype(int).fillna(0)
     
-    register_feature("morning_star", category="price_action", requires_shift=False)
-    register_feature("evening_star", category="price_action", requires_shift=False)
+    try:
+        register_feature("morning_star", category="price_action", requires_shift=False)
+        register_feature("evening_star", category="price_action", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to register star features: {e}")
     
     return df
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# RETURNS & MOMENTUM
-# ═══════════════════════════════════════════════════════════════════════════
-
 def calculate_returns(df: pd.DataFrame, tf: str = "1h") -> pd.DataFrame:
-    """v79: Calculate return features (requires_shift=False)."""
-    df["return_1bar"] = df["close"].pct_change(1)
-    df["return_5bar"] = df["close"].pct_change(5)
-    df["return_20bar"] = df["close"].pct_change(20)
-    df["log_return_1bar"] = np.log(df["close"] / df["close"].shift(1))
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    
+    if 'close' not in df.columns:
+        return df
+    
+    df = df.copy()
+    df_work = df[['close']].astype(float)
+    
+    df["return_1bar"] = df_work["close"].pct_change(1).fillna(0)
+    df["return_5bar"] = df_work["close"].pct_change(5).fillna(0)
+    df["return_20bar"] = df_work["close"].pct_change(20).fillna(0)
+    
+    log_ret = np.log(df_work["close"] / df_work["close"].shift(1))
+    df["log_return_1bar"] = log_ret.replace([np.inf, -np.inf], 0).fillna(0)
+    
     df["acceleration"] = df["return_1bar"] - df["return_1bar"].shift(1)
+    df["acceleration"] = df["acceleration"].fillna(0)
+    
     df["jerk"] = df["acceleration"] - df["acceleration"].shift(1)
-    df["price_velocity"] = df["return_1bar"].rolling(5).sum()
+    df["jerk"] = df["jerk"].fillna(0)
+    
+    df["price_velocity"] = df["return_1bar"].rolling(5, min_periods=1).sum().fillna(0)
     
     for feat in ["return_1bar", "return_5bar", "return_20bar", 
                  "log_return_1bar", "acceleration", "jerk", "price_velocity"]:
-        register_feature(feat, category="returns", requires_shift=False)
+        try:
+            register_feature(feat, category="returns", requires_shift=False)
+        except Exception as e:
+            logger.warning(f"Failed to register {feat}: {e}")
     
     return df
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN FEATURE ENGINEERING PIPELINE
-# ═══════════════════════════════════════════════════════════════════════════
 
 def engineer_features_for_timeframe(
     df: pd.DataFrame,
     timeframe: str = "1h",
     compute_advanced: bool = True
 ) -> Tuple[pd.DataFrame, Dict[str, FeatureMetadata]]:
-    """v79: Complete feature engineering pipeline.
     
-    Generates technical indicators, price action patterns, and momentum features.
-    All features properly aligned without double-shift data leakage.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Clean OHLCV data with timestamp, open, high, low, close, volume
-    timeframe : str, default="1h"
-        Timeframe of data (used for lookback calculations)
-    compute_advanced : bool, default=True
-        Include advanced features (slower but more comprehensive)
-    
-    Returns
-    -------
-    Tuple[pd.DataFrame, Dict[str, FeatureMetadata]]
-        (Features DataFrame, Feature registry)
-    
-    Raises
-    ------
-    FeatureEngineeringError
-        If feature engineering fails
-    """
-    if df is None or df.empty:
-        raise FeatureEngineeringError("Empty DataFrame")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise FeatureEngineeringError("Empty or invalid DataFrame")
     
     required_cols = ['open', 'high', 'low', 'close', 'volume']
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise FeatureEngineeringError(f"Missing columns: {missing}")
+        raise FeatureEngineeringError(f"Missing required columns: {missing}")
     
-    df_feat = df.copy()
-    logger.info(f"engineer_features_for_timeframe: {len(df_feat)} rows, {timeframe}")
+    try:
+        df_feat = df.copy()
+        df_feat = df_feat.astype({col: float for col in ['open', 'high', 'low', 'close', 'volume']}, errors='ignore')
+    except Exception as e:
+        raise FeatureEngineeringError(f"Failed to convert columns to float: {e}")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # STAGE 1: CORE TECHNICAL INDICATORS
-    # ─────────────────────────────────────────────────────────────────────────
+    logger.info(f"engineer_features_for_timeframe: {len(df_feat)} rows, timeframe={timeframe}")
     
-    # RSI (14-period)
-    df_feat["rsi_14"] = compute_rsi(df_feat["close"], period=14)
-    register_feature("rsi_14", category="momentum", requires_shift=False)
+    try:
+        df_feat["rsi_14"] = compute_rsi(df_feat["close"], period=14)
+        register_feature("rsi_14", category="momentum", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to compute RSI: {e}")
     
-    # MACD
-    macd, signal, histogram = compute_macd(df_feat["close"])
-    df_feat["macd"] = macd
-    df_feat["macd_signal"] = signal
-    df_feat["macd_histogram"] = histogram
-    register_feature("macd", category="momentum", requires_shift=False)
-    register_feature("macd_signal", category="momentum", requires_shift=False)
-    register_feature("macd_histogram", category="momentum", requires_shift=False)
+    try:
+        macd, signal, histogram = compute_macd(df_feat["close"])
+        df_feat["macd"] = macd
+        df_feat["macd_signal"] = signal
+        df_feat["macd_histogram"] = histogram
+        register_feature("macd", category="momentum", requires_shift=False)
+        register_feature("macd_signal", category="momentum", requires_shift=False)
+        register_feature("macd_histogram", category="momentum", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to compute MACD: {e}")
     
-    # Bollinger Bands
-    upper_bb, middle_bb, lower_bb = compute_bollinger_bands(df_feat["close"], period=20)
-    df_feat["bb_upper"] = upper_bb
-    df_feat["bb_middle"] = middle_bb
-    df_feat["bb_lower"] = lower_bb
-    df_feat["bb_width"] = upper_bb - lower_bb
-    df_feat["bb_position"] = (df_feat["close"] - lower_bb) / (upper_bb - lower_bb + 1e-10)
-    register_feature("bb_width", category="volatility", requires_shift=False)
-    register_feature("bb_position", category="volatility", requires_shift=False)
+    try:
+        upper_bb, middle_bb, lower_bb = compute_bollinger_bands(df_feat["close"], period=20)
+        df_feat["bb_upper"] = upper_bb
+        df_feat["bb_middle"] = middle_bb
+        df_feat["bb_lower"] = lower_bb
+        df_feat["bb_width"] = upper_bb - lower_bb
+        df_feat["bb_position"] = (df_feat["close"] - lower_bb) / (upper_bb - lower_bb + 1e-10)
+        register_feature("bb_width", category="volatility", requires_shift=False)
+        register_feature("bb_position", category="volatility", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to compute Bollinger Bands: {e}")
     
-    # ATR (14-period)
-    df_feat["atr_14"] = compute_atr(df_feat["high"], df_feat["low"], df_feat["close"], period=14)
-    register_feature("atr_14", category="volatility", requires_shift=False)
+    try:
+        df_feat["atr_14"] = compute_atr(df_feat["high"], df_feat["low"], df_feat["close"], period=14)
+        register_feature("atr_14", category="volatility", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to compute ATR: {e}")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # STAGE 2: PRICE ACTION PATTERNS
-    # ─────────────────────────────────────────────────────────────────────────
+    try:
+        df_feat = detect_engulfing(df_feat)
+        df_feat = detect_doji(df_feat)
+        df_feat = detect_inside_bar(df_feat)
+        df_feat = detect_three_bar_patterns(df_feat)
+        df_feat = detect_morning_evening_star(df_feat)
+    except Exception as e:
+        logger.warning(f"Failed to detect price patterns: {e}")
     
-    df_feat = detect_engulfing(df_feat)
-    df_feat = detect_doji(df_feat)
-    df_feat = detect_inside_bar(df_feat)
-    df_feat = detect_three_bar_patterns(df_feat)
-    df_feat = detect_morning_evening_star(df_feat)
+    try:
+        df_feat = calculate_returns(df_feat, tf=timeframe)
+    except Exception as e:
+        logger.warning(f"Failed to calculate returns: {e}")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # STAGE 3: RETURNS & MOMENTUM
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    df_feat = calculate_returns(df_feat, tf=timeframe)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # STAGE 4: VOLUME FEATURES
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    df_feat["volume_sma"] = df_feat["volume"].rolling(20).mean()
-    df_feat["volume_ratio"] = df_feat["volume"] / (df_feat["volume_sma"] + 1e-10)
-    register_feature("volume_ratio", category="volume", requires_shift=False)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # STAGE 5: ADVANCED FEATURES (Optional)
-    # ─────────────────────────────────────────────────────────────────────────
+    try:
+        df_feat["volume_sma"] = df_feat["volume"].rolling(20, min_periods=1).mean()
+        df_feat["volume_ratio"] = df_feat["volume"] / (df_feat["volume_sma"] + 1e-10)
+        df_feat["volume_ratio"] = df_feat["volume_ratio"].replace([np.inf, -np.inf], 1.0).fillna(1.0)
+        register_feature("volume_ratio", category="volume", requires_shift=False)
+    except Exception as e:
+        logger.warning(f"Failed to compute volume features: {e}")
     
     if compute_advanced:
-        # Stochastic
-        k_pct, d_pct = compute_stochastic(df_feat["high"], df_feat["low"], df_feat["close"])
-        df_feat["stoch_k"] = k_pct
-        df_feat["stoch_d"] = d_pct
-        register_feature("stoch_k", category="momentum", requires_shift=False)
-        register_feature("stoch_d", category="momentum", requires_shift=False)
+        try:
+            k_pct, d_pct = compute_stochastic(df_feat["high"], df_feat["low"], df_feat["close"])
+            df_feat["stoch_k"] = k_pct
+            df_feat["stoch_d"] = d_pct
+            register_feature("stoch_k", category="momentum", requires_shift=False)
+            register_feature("stoch_d", category="momentum", requires_shift=False)
+        except Exception as e:
+            logger.warning(f"Failed to compute Stochastic: {e}")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # FINAL: APPLY SINGLE SHIFT FOR INFERENCE CAUSALITY (v79 FIX)
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    # All features already aligned correctly from their calculations
-    # No additional shift needed - they already use past/current bar data
-    
-    final_count = len(df_feat)
     feature_cols = [c for c in df_feat.columns if c not in df.columns]
     logger.info(f"engineer_features_for_timeframe: generated {len(feature_cols)} features")
     
     return df_feat, {}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# EXPORTS
-# ═══════════════════════════════════════════════════════════════════════════
-
 __all__ = [
-    # Classes
     'FeatureMetadata',
-    
-    # Exceptions
     'FeatureEngineeringError', 'FeatureRegistrationError',
-    
-    # Technical Indicators
     'compute_rsi', 'compute_macd', 'compute_bollinger_bands',
     'compute_atr', 'compute_stochastic',
-    
-    # Price Action Patterns
     'detect_engulfing', 'detect_doji', 'detect_inside_bar',
     'detect_three_bar_patterns', 'detect_morning_evening_star',
-    
-    # Returns & Momentum
     'calculate_returns',
-    
-    # Main Pipeline
     'engineer_features_for_timeframe',
 ]

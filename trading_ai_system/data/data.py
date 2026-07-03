@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from threading import Lock
 
 import numpy as np
 import pandas as pd
 
-# ✅ Fixed: Proper import paths
 try:
     from trading_ai_system.core import (
         logger, TradingSystemError, DataError, ConfigError,
@@ -23,7 +23,6 @@ try:
         validate_dataframe, validate_numeric_columns
     )
 except ImportError:
-    # Fallback for direct execution
     import logging
     logger = logging.getLogger(__name__)
     
@@ -52,31 +51,17 @@ except ImportError:
         return True, []
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# EXCEPTION CLASSES
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DataLoadError(DataError):
-    """Failed to load data from source."""
     pass
-
 
 class DataValidationError(DataError):
-    """Data validation failed."""
     pass
-
 
 class DataCleaningError(DataError):
-    """Data cleaning failed."""
     pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ENUMS
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DataSource(str, Enum):
-    """Data source types."""
     CSV = "csv"
     PARQUET = "parquet"
     SQLITE = "sqlite"
@@ -85,7 +70,6 @@ class DataSource(str, Enum):
 
 
 class DataFrequency(str, Enum):
-    """Data frequency/timeframe."""
     M1 = "1min"
     M5 = "5min"
     M15 = "15min"
@@ -96,13 +80,8 @@ class DataFrequency(str, Enum):
     W1 = "1w"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA QUALITY CLASSES
-# ═══════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class DataQualityReport:
-    """Data quality assessment report."""
     passed: bool = True
     row_count: int = 0
     time_span: str = ""
@@ -113,22 +92,20 @@ class DataQualityReport:
     quality_score: float = 100.0
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "passed": self.passed,
             "row_count": self.row_count,
             "time_span": self.time_span,
-            "ohlc_missing_pct": self.ohlc_missing_pct,
-            "volume_stats": self.volume_stats,
-            "price_range": self.price_range,
-            "quality_warnings": self.quality_warnings,
+            "ohlc_missing_pct": self.ohlc_missing_pct.copy(),
+            "volume_stats": self.volume_stats.copy(),
+            "price_range": {k: v.copy() for k, v in self.price_range.items()},
+            "quality_warnings": self.quality_warnings.copy(),
             "quality_score": self.quality_score
         }
 
 
 @dataclass
 class TimeGapReport:
-    """Time gap detection report."""
     total_gaps: int = 0
     largest_gap: Optional[Dict[str, Any]] = None
     gap_locations: List[Dict[str, Any]] = field(default_factory=list)
@@ -136,22 +113,16 @@ class TimeGapReport:
     coverage_pct: float = 100.0
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "total_gaps": self.total_gaps,
-            "largest_gap": self.largest_gap,
-            "gap_locations": self.gap_locations,
+            "largest_gap": self.largest_gap.copy() if self.largest_gap else None,
+            "gap_locations": [g.copy() for g in self.gap_locations],
             "has_anomalies": self.has_anomalies,
             "coverage_pct": self.coverage_pct
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
-
 def ensure_naive_utc_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
-    """Convert timestamp to UTC-naive datetime."""
     if ts is pd.NaT or pd.isna(ts):
         return pd.NaT
     
@@ -164,21 +135,26 @@ def ensure_naive_utc_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
 
 
 def ensure_naive_utc_series(ts_series: pd.Series) -> pd.Series:
-    """Convert timestamp series to UTC-naive."""
     if not isinstance(ts_series, pd.Series):
         return ts_series
     
-    # Already naive
-    if ts_series.dtype == 'object' or str(ts_series.dtype).startswith('datetime'):
+    try:
+        if ts_series.dtype == 'object':
+            ts_series = pd.to_datetime(ts_series)
+        
         if hasattr(ts_series.dtype, 'tz') and ts_series.dtype.tz is not None:
-            return pd.to_datetime(ts_series, utc=True).dt.tz_localize(None)
-        return pd.to_datetime(ts_series)
-    
-    return ts_series
+            ts_series = ts_series.dt.tz_convert('UTC').dt.tz_localize(None)
+        
+        return ts_series
+    except Exception as e:
+        logger.warning(f"Failed to convert timestamp series: {e}")
+        return ts_series
 
 
 def drop_broker_noise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove broker-specific noise columns."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    
     noise_cols = {
         'bid', 'ask', 'bid_volume', 'ask_volume',
         'spread', 'real_volume', 'vwap', 'twap',
@@ -188,14 +164,10 @@ def drop_broker_noise_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols_to_drop = [c for c in df.columns if c.lower() in noise_cols]
     if cols_to_drop:
         logger.debug(f"Dropping noise columns: {cols_to_drop}")
-        df = df.drop(columns=cols_to_drop)
+        df = df.drop(columns=cols_to_drop, errors='ignore')
     
     return df
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA CLEANING
-# ═══════════════════════════════════════════════════════════════════════════
 
 def clean_ohlcv_data(
     df: pd.DataFrame,
@@ -203,31 +175,9 @@ def clean_ohlcv_data(
     zscore_threshold: float = 5.0,
     volume_min_pct: float = 0.01,
 ) -> pd.DataFrame:
-    """v79: Clean raw OHLCV data with NaN handling and outlier clipping.
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise DataCleaningError("Input DataFrame is empty or invalid")
     
-    Performs comprehensive data validation and cleaning:
-    - Removes invalid timestamps & duplicate candles
-    - Detects & removes structurally invalid OHLC patterns
-    - Handles NaN values via limited ffill (max 3 bars)
-    - Clips outliers using z-score (default: 5σ threshold)
-    - Cleans volume data with sensible defaults
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw OHLCV data
-    max_ffill_periods : int, default=3
-        Max consecutive bars to forward-fill
-    zscore_threshold : float, default=5.0
-        Outlier clipping threshold (σ units)
-    volume_min_pct : float, default=0.01
-        Minimum volume as % of median
-    
-    Returns
-    -------
-    pd.DataFrame
-        Cleaned OHLCV data
-    """
     df_clean = df.copy()
     df_clean = drop_broker_noise_columns(df_clean)
     
@@ -239,168 +189,96 @@ def clean_ohlcv_data(
     initial_count = len(df_clean)
     logger.info(f"clean_ohlcv_data: processing {initial_count:,} rows")
     
-    # Stage 1: TIMESTAMP & STRUCTURE VALIDATION
     df_clean['timestamp'] = ensure_naive_utc_series(df_clean['timestamp'])
     
-    invalid_ts = df_clean['timestamp'].isna()
-    if invalid_ts.sum() > 0:
-        logger.warning(f"  Removing {invalid_ts.sum():,} invalid timestamps")
-        df_clean = df_clean[~invalid_ts].copy()
+    df_clean = df_clean.drop_duplicates(subset=['timestamp'], keep='first')
+    removed_dups = initial_count - len(df_clean)
+    if removed_dups > 0:
+        logger.debug(f"Removed {removed_dups} duplicate rows")
     
-    dups = df_clean['timestamp'].duplicated()
-    if dups.sum() > 0:
-        logger.warning(f"  Removing {dups.sum():,} duplicate timestamps")
-        df_clean = df_clean[~dups].copy()
+    valid_ohlc = (df_clean['low'] <= df_clean['close']) & \
+                 (df_clean['high'] >= df_clean['close']) & \
+                 (df_clean['low'] <= df_clean['open']) & \
+                 (df_clean['high'] >= df_clean['open']) & \
+                 (df_clean['low'] <= df_clean['high'])
     
-    # Stage 2: CONVERT & VALIDATE OHLC
+    invalid_count = (~valid_ohlc).sum()
+    if invalid_count > 0:
+        df_clean = df_clean[valid_ohlc].copy()
+        logger.warning(f"Removed {invalid_count} structurally invalid OHLC rows")
+    
     for col in ['open', 'high', 'low', 'close']:
-        df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+        if col in df_clean.columns:
+            nan_count = df_clean[col].isna().sum()
+            if nan_count > 0:
+                df_clean[col] = df_clean[col].fillna(method='ffill', limit=max_ffill_periods)
+                remaining_nan = df_clean[col].isna().sum()
+                if remaining_nan > 0:
+                    df_clean = df_clean[df_clean[col].notna()].copy()
+                    logger.warning(f"Removed {remaining_nan} rows with irreplaceable NaN in '{col}'")
     
-    critical_nan = df_clean[required_cols].isna().all(axis=1)
-    if critical_nan.sum() > 0:
-        logger.warning(f"  Removing {critical_nan.sum():,} all-NaN rows")
-        df_clean = df_clean[~critical_nan].copy()
-    
-    # Stage 3: LIMITED FORWARD-FILL
     for col in ['open', 'high', 'low', 'close']:
-        nan_mask = df_clean[col].isna()
-        if nan_mask.sum() > 0:
-            df_clean[col] = df_clean[col].fillna(method='ffill', limit=max_ffill_periods)
-            still_nan = df_clean[col].isna().sum()
-            filled = nan_mask.sum() - still_nan
-            if filled > 0:
-                logger.debug(f"  Forward-filled {filled} NaN in '{col}'")
-    
-    remaining_nan = df_clean[required_cols].isna().any(axis=1)
-    if remaining_nan.sum() > 0:
-        logger.warning(f"  Removing {remaining_nan.sum():,} unfillable NaN rows")
-        df_clean = df_clean[~remaining_nan].copy()
-    
-    # Stage 4: STRUCTURAL OHLC VALIDATION
-    invalid_patterns = (
-        (df_clean['high'] < df_clean['low']) |
-        (df_clean['high'] < df_clean['open']) |
-        (df_clean['high'] < df_clean['close']) |
-        (df_clean['low'] > df_clean['open']) |
-        (df_clean['low'] > df_clean['close'])
-    )
-    
-    if invalid_patterns.sum() > 0:
-        logger.warning(f"  Removing {invalid_patterns.sum():,} invalid candles")
-        df_clean = df_clean[~invalid_patterns].copy()
-    
-    # Stage 5: OUTLIER CLIPPING VIA Z-SCORE
-    for col in ['open', 'high', 'low', 'close']:
-        prices = df_clean[col]
-        mean = prices.mean()
-        std = prices.std()
-        
-        if std > 0:
-            z_scores = np.abs((prices - mean) / std)
-            outliers = z_scores > zscore_threshold
+        if col in df_clean.columns:
+            numeric_df = df_clean[[col]].apply(pd.to_numeric, errors='coerce')
+            mean = numeric_df[col].mean()
+            std = numeric_df[col].std()
             
-            if outliers.sum() > 0:
-                lower_bound = mean - zscore_threshold * std
-                upper_bound = mean + zscore_threshold * std
-                df_clean[col] = df_clean[col].clip(lower_bound, upper_bound)
-                logger.debug(f"  Clipped {outliers.sum():,} outliers in '{col}'")
+            if std > 0:
+                z_scores = np.abs((numeric_df[col] - mean) / std)
+                outliers = z_scores > zscore_threshold
+                if outliers.any():
+                    df_clean.loc[outliers, col] = mean
+                    logger.debug(f"Clipped {outliers.sum()} outliers in '{col}'")
     
-    # Stage 6: VOLUME CLEANING
     if 'volume' in df_clean.columns:
-        df_clean['volume'] = pd.to_numeric(df_clean['volume'], errors='coerce')
-        df_clean['volume'] = df_clean['volume'].fillna(method='ffill', limit=2)
-        df_clean['volume'] = df_clean['volume'].fillna(0.0)
+        vol_median = df_clean['volume'][df_clean['volume'] > 0].median()
+        if pd.isna(vol_median) or vol_median == 0:
+            vol_median = 1.0
         
-        if df_clean['volume'].sum() > 0:
-            median_vol = df_clean['volume'].median()
-            min_vol = median_vol * volume_min_pct
-            micro_vol = (df_clean['volume'] > 0) & (df_clean['volume'] < min_vol)
-            
-            if micro_vol.sum() > 0:
-                logger.debug(f"  Flagged {micro_vol.sum():,} micro-volume candles")
-    else:
-        df_clean['volume'] = 0.0
+        vol_min_threshold = vol_median * volume_min_pct
+        df_clean.loc[(df_clean['volume'] > 0) & (df_clean['volume'] < vol_min_threshold), 'volume'] = 0
+        df_clean.loc[df_clean['volume'].isna(), 'volume'] = 0
+        
+        logger.debug(f"Cleaned volume data: median={vol_median:.2f}, min_threshold={vol_min_threshold:.2f}")
+    
+    df_clean = df_clean.sort_values('timestamp').reset_index(drop=True)
     
     final_count = len(df_clean)
-    removed = initial_count - final_count
-    pct_removed = (removed / initial_count * 100) if initial_count > 0 else 0.0
-    
-    logger.info(
-        f"clean_ohlcv_data: completed. "
-        f"Initial: {initial_count:,} → Final: {final_count:,} "
-        f"(Removed: {removed:,} | {pct_removed:.1f}%)"
-    )
+    removed_total = initial_count - final_count
+    logger.info(f"clean_ohlcv_data complete: {final_count:,} rows remaining ({removed_total:,} removed)")
     
     return df_clean
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA VALIDATION
-# ═══════════════════════════════════════════════════════════════════════════
-
 def validate_data_quality(
     df: pd.DataFrame,
-    min_rows: int = 100,
     max_missing_pct: float = 5.0,
     warn_on_sparse: bool = True,
 ) -> DataQualityReport:
-    """v79: Comprehensive data quality report (read-only).
+    report = DataQualityReport()
     
-    Validates cleaned OHLCV data against quality thresholds.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Cleaned OHLCV data
-    min_rows : int, default=100
-        Minimum acceptable row count
-    max_missing_pct : float, default=5.0
-        Max missing % per column before warning
-    warn_on_sparse : bool, default=True
-        Warn if volume sparse
-    
-    Returns
-    -------
-    DataQualityReport
-        Quality assessment with score and warnings
-    """
-    report = DataQualityReport(
-        passed=True,
-        row_count=len(df),
-        quality_score=100.0
-    )
-    
-    if len(df) == 0:
+    if not isinstance(df, pd.DataFrame) or df.empty:
         report.passed = False
-        report.quality_warnings.append("Empty DataFrame")
-        report.quality_score = 0.0
+        report.quality_warnings.append("DataFrame is empty or invalid")
         return report
     
-    # Check row count
-    if len(df) < min_rows:
-        report.passed = False
-        report.quality_warnings.append(f"Insufficient rows: {len(df)} < {min_rows}")
-        report.quality_score -= 20.0
+    report.row_count = len(df)
     
-    # Check time span
-    if "timestamp" in df.columns:
-        try:
-            ts_min = df["timestamp"].min()
-            ts_max = df["timestamp"].max()
-            td = ts_max - ts_min
-            
-            if td.days > 0:
-                report.time_span = f"{td.days} days, {td.seconds // 3600} hours"
-            else:
-                report.time_span = f"{td.seconds // 3600} hours"
-            
-            if td.total_seconds() < 3600:
-                report.quality_warnings.append("Data span < 1 hour")
-                report.quality_score -= 15.0
-        except Exception as e:
-            report.quality_warnings.append(f"Timestamp parsing error: {e}")
+    try:
+        if 'timestamp' in df.columns:
+            ts = pd.to_datetime(df['timestamp'], errors='coerce')
+            if ts.notna().sum() > 0:
+                valid_ts = ts[ts.notna()]
+                if len(valid_ts) > 1:
+                    report.time_span = str(valid_ts.max() - valid_ts.min())
+                    td = valid_ts.max() - valid_ts.min()
+                    
+                    if td.total_seconds() < 3600:
+                        report.quality_warnings.append("Data span < 1 hour")
+                        report.quality_score -= 15.0
+    except Exception as e:
+        report.quality_warnings.append(f"Timestamp parsing error: {e}")
     
-    # Check OHLC missing %
     for col in ["open", "high", "low", "close"]:
         if col in df.columns:
             missing_pct = (df[col].isna().sum() / len(df)) * 100
@@ -411,15 +289,15 @@ def validate_data_quality(
                 report.quality_warnings.append(f"High missing in '{col}': {missing_pct:.1f}%")
                 report.quality_score -= 10.0
             
-            if col in df.columns and df[col].notna().any():
+            valid_vals = df[col][df[col].notna()]
+            if len(valid_vals) > 0:
                 report.price_range[col] = {
-                    "min": float(df[col].min()),
-                    "max": float(df[col].max()),
+                    "min": float(valid_vals.min()),
+                    "max": float(valid_vals.max()),
                 }
     
-    # Check volume stats
     if "volume" in df.columns:
-        vol_data = df["volume"][df["volume"] > 0]
+        vol_data = df["volume"][(df["volume"] > 0) & (df["volume"].notna())]
         report.volume_stats = {
             "min": float(vol_data.min()) if len(vol_data) > 0 else 0.0,
             "max": float(vol_data.max()) if len(vol_data) > 0 else 0.0,
@@ -427,15 +305,15 @@ def validate_data_quality(
             "zero_count": int((df["volume"] == 0).sum()),
         }
         
-        if warn_on_sparse and vol_data.median() < 1.0:
+        if warn_on_sparse and len(vol_data) > 0 and vol_data.median() < 1.0:
             report.quality_warnings.append("Sparse volume (median < 1.0)")
             report.quality_score -= 5.0
     
-    # Check for inf values
     for col in ["open", "high", "low", "close"]:
-        if col in df.columns and np.isinf(df[col]).any():
-            report.quality_warnings.append(f"Infinity values in '{col}'")
-            report.quality_score -= 10.0
+        if col in df.columns:
+            if np.isinf(df[col]).any():
+                report.quality_warnings.append(f"Infinity values in '{col}'")
+                report.quality_score -= 10.0
     
     report.quality_score = max(0.0, min(100.0, report.quality_score))
     report.passed = report.quality_score >= 60.0
@@ -449,44 +327,34 @@ def validate_data_quality(
     return report
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TIME GAP DETECTION
-# ═══════════════════════════════════════════════════════════════════════════
-
 def detect_time_gaps(
     df: pd.DataFrame,
     expected_interval_minutes: int = 60,
     gap_threshold_multiplier: float = 1.5,
 ) -> TimeGapReport:
-    """v79: Detect missing candles (time gaps) in OHLCV data.
-    
-    Identifies breaks in continuous time series (market closures, errors).
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        OHLCV data with timestamp column
-    expected_interval_minutes : int, default=60
-        Expected time between consecutive candles
-    gap_threshold_multiplier : float, default=1.5
-        Flag gaps > N * expected_interval as anomalies
-    
-    Returns
-    -------
-    TimeGapReport
-        Gap analysis with anomaly classification
-    """
     report = TimeGapReport()
     
-    if len(df) < 2 or "timestamp" not in df.columns:
+    if not isinstance(df, pd.DataFrame) or len(df) < 2:
+        return report
+    
+    if "timestamp" not in df.columns:
         return report
     
     try:
-        timestamps = pd.to_datetime(df["timestamp"])
+        timestamps = pd.to_datetime(df["timestamp"], errors='coerce')
+        valid_mask = timestamps.notna()
+        
+        if valid_mask.sum() < 2:
+            return report
+        
+        timestamps = timestamps[valid_mask]
         diffs = timestamps.diff().dt.total_seconds() / 60
         
+        if expected_interval_minutes <= 0:
+            expected_interval_minutes = 60
+        
         expected_gap_threshold = expected_interval_minutes * gap_threshold_multiplier
-        gap_indices = np.where(diffs > expected_interval_minutes)[0]
+        gap_indices = np.where((diffs > expected_interval_minutes) & (diffs.notna()))[0]
         
         if len(gap_indices) == 0:
             report.coverage_pct = 100.0
@@ -500,7 +368,7 @@ def detect_time_gaps(
             
             gap_info = {
                 "index": int(idx),
-                "start_ts": str(timestamps.iloc[idx - 1]),
+                "start_ts": str(timestamps.iloc[idx - 1]) if idx > 0 else "N/A",
                 "end_ts": str(timestamps.iloc[idx]),
                 "duration_minutes": round(gap_minutes, 1),
                 "duration_hours": round(gap_minutes / 60, 2),
@@ -514,19 +382,20 @@ def detect_time_gaps(
             
             if (report.largest_gap is None or 
                 gap_minutes > report.largest_gap["duration_minutes"]):
-                report.largest_gap = gap_info
+                report.largest_gap = gap_info.copy()
         
-        # Calculate coverage %
         total_time_span = (timestamps.iloc[-1] - timestamps.iloc[0]).total_seconds() / 60
-        expected_candles = total_time_span / expected_interval_minutes
-        actual_candles = len(df) - 1
-        if expected_candles > 0:
-            report.coverage_pct = (actual_candles / expected_candles) * 100.0
+        if total_time_span > 0:
+            expected_candles = total_time_span / expected_interval_minutes
+            actual_candles = len(timestamps) - 1
+            if expected_candles > 0:
+                report.coverage_pct = (actual_candles / expected_candles) * 100.0
         
         if report.has_anomalies:
+            anomaly_count = sum(1 for g in report.gap_locations if g['is_anomaly'])
             logger.warning(
                 f"detect_time_gaps: Found {report.total_gaps} gaps, "
-                f"{sum(1 for g in report.gap_locations if g['is_anomaly'])} anomalies"
+                f"{anomaly_count} anomalies"
             )
         
     except Exception as e:
@@ -535,19 +404,21 @@ def detect_time_gaps(
     return report
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA LOADING
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DataLoader:
-    """Load data from various sources."""
+    _lock = Lock()
     
     @staticmethod
     def load_csv(path: str, **kwargs) -> pd.DataFrame:
-        """Load data from CSV file."""
         try:
-            df = pd.read_csv(path, **kwargs)
-            logger.info(f"Loaded {len(df):,} rows from {path}")
+            p = Path(path)
+            if not p.exists():
+                raise DataLoadError(f"CSV file not found: {path}")
+            
+            df = pd.read_csv(p, **kwargs)
+            if df.empty:
+                logger.warning(f"CSV file is empty: {path}")
+            else:
+                logger.info(f"Loaded {len(df):,} rows from {path}")
             return df
         except FileNotFoundError:
             raise DataLoadError(f"CSV file not found: {path}")
@@ -556,10 +427,16 @@ class DataLoader:
     
     @staticmethod
     def load_parquet(path: str, **kwargs) -> pd.DataFrame:
-        """Load data from Parquet file."""
         try:
-            df = pd.read_parquet(path, **kwargs)
-            logger.info(f"Loaded {len(df):,} rows from {path}")
+            p = Path(path)
+            if not p.exists():
+                raise DataLoadError(f"Parquet file not found: {path}")
+            
+            df = pd.read_parquet(p, **kwargs)
+            if df.empty:
+                logger.warning(f"Parquet file is empty: {path}")
+            else:
+                logger.info(f"Loaded {len(df):,} rows from {path}")
             return df
         except FileNotFoundError:
             raise DataLoadError(f"Parquet file not found: {path}")
@@ -567,9 +444,14 @@ class DataLoader:
             raise DataLoadError(f"Failed to load Parquet {path}: {e}")
     
     @staticmethod
-    def load(path: str, source: DataSource = DataSource.CSV, **kwargs) -> pd.DataFrame:
-        """Load data from any supported source."""
+    def load(path: str, source: Union[DataSource, str] = DataSource.CSV, **kwargs) -> pd.DataFrame:
         path = str(path)
+        
+        if isinstance(source, str):
+            try:
+                source = DataSource(source.lower())
+            except ValueError:
+                raise DataLoadError(f"Unsupported data source: {source}")
         
         if source == DataSource.CSV:
             return DataLoader.load_csv(path, **kwargs)
@@ -579,16 +461,14 @@ class DataLoader:
             raise DataLoadError(f"Unsupported data source: {source}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA SAVING
-# ═══════════════════════════════════════════════════════════════════════════
-
 class DataSaver:
-    """Save data to various formats."""
+    _lock = Lock()
     
     @staticmethod
     def save_csv(df: pd.DataFrame, path: str, index: bool = False, **kwargs) -> None:
-        """Save data to CSV file."""
+        if not isinstance(df, pd.DataFrame):
+            raise DataError("Input must be a pandas DataFrame")
+        
         try:
             ensure_path(path)
             df.to_csv(path, index=index, **kwargs)
@@ -598,7 +478,9 @@ class DataSaver:
     
     @staticmethod
     def save_parquet(df: pd.DataFrame, path: str, **kwargs) -> None:
-        """Save data to Parquet file."""
+        if not isinstance(df, pd.DataFrame):
+            raise DataError("Input must be a pandas DataFrame")
+        
         try:
             ensure_path(path)
             df.to_parquet(path, **kwargs)
@@ -608,7 +490,9 @@ class DataSaver:
     
     @staticmethod
     def save(df: pd.DataFrame, path: str, fmt: str = "csv", **kwargs) -> None:
-        """Save data to file in specified format."""
+        if not isinstance(df, pd.DataFrame):
+            raise DataError("Input must be a pandas DataFrame")
+        
         if fmt.lower() == "csv":
             DataSaver.save_csv(df, path, **kwargs)
         elif fmt.lower() == "parquet":
@@ -617,21 +501,10 @@ class DataSaver:
             raise DataError(f"Unsupported format: {fmt}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# EXPORTS
-# ═══════════════════════════════════════════════════════════════════════════
-
 __all__ = [
-    # Enums
     'DataSource', 'DataFrequency',
-    
-    # Classes & Reports
     'DataQualityReport', 'TimeGapReport', 'DataLoader', 'DataSaver',
-    
-    # Exceptions
     'DataLoadError', 'DataValidationError', 'DataCleaningError',
-    
-    # Functions
     'ensure_naive_utc_timestamp', 'ensure_naive_utc_series',
     'drop_broker_noise_columns', 'clean_ohlcv_data',
     'validate_data_quality', 'detect_time_gaps',
