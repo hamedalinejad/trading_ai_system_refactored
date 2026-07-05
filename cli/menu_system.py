@@ -1,16 +1,29 @@
 """
 Interactive Menu System for Trading AI System
 
-Provides a user-friendly interactive menu for all system operations.
+v79.1 Enhancements:
+- Thread-safe menu operations
+- Better error handling
+- Proper terminal control
+- Session management
+- Menu history
+
+Provides user-friendly interactive menu for all system operations.
 """
 
 import sys
 import os
-from typing import Callable, Dict, List, Tuple
+import logging
+from typing import Callable, Dict, List, Tuple, Optional
 from enum import Enum
+from threading import RLock
 
-from trading_ai_system import __version__
-from trading_ai_system.core import logger
+logger = logging.getLogger(__name__)
+
+try:
+    from trading_ai_system import __version__
+except ImportError:
+    __version__ = "0.79.1"
 
 
 class MenuOption(Enum):
@@ -27,13 +40,16 @@ class MenuOption(Enum):
 
 
 class InteractiveMenu:
-    """Interactive menu system for user interaction."""
+    """Interactive menu system with thread safety."""
 
     def __init__(self):
         """Initialize menu system."""
         self.running = True
         self.current_menu = "main"
         self.config = {}
+        self.menu_history: List[str] = ["main"]
+        self._lock = RLock()
+        self.logger = logger
         
         # Menu items structure
         self.menus = {
@@ -48,17 +64,36 @@ class InteractiveMenu:
 
     def run(self) -> None:
         """Start the interactive menu."""
-        self._clear_screen()
-        self._show_banner()
+        try:
+            self._clear_screen()
+            self._show_banner()
+            
+            while self.running:
+                try:
+                    self._display_menu(self.current_menu)
+                    choice = self._get_user_input()
+                    self._process_choice(choice)
+                except KeyboardInterrupt:
+                    self.logger.info("Menu interrupted by user")
+                    print("\n\n❌ Operation cancelled.\n")
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Menu error: {e}", exc_info=True)
+                    print(f"\n❌ Error: {e}\n")
+                    input("Press Enter to continue...")
         
-        while self.running:
-            self._display_menu(self.current_menu)
-            choice = self._get_user_input()
-            self._process_choice(choice)
+        except Exception as e:
+            self.logger.error(f"Fatal menu error: {e}", exc_info=True)
+            print(f"\nFatal error: {e}")
+            sys.exit(1)
 
     def _clear_screen(self) -> None:
         """Clear terminal screen."""
-        os.system('cls' if os.name == 'nt' else 'clear')
+        try:
+            os.system('cls' if os.name == 'nt' else 'clear')
+        except Exception as e:
+            self.logger.warning(f"Failed to clear screen: {e}")
+            print("\n" * 3)
 
     def _show_banner(self) -> None:
         """Display system banner."""
@@ -68,6 +103,8 @@ class InteractiveMenu:
 ║          🤖 TRADING AI SYSTEM v{__version__:<48}║
 ║                                                                           ║
 ║   Production-grade algorithmic trading system with ML models             ║
+║                                                                           ║
+║   Thread-safe • Async-ready • Production-grade                           ║
 ║                                                                           ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
         """
@@ -167,35 +204,41 @@ class InteractiveMenu:
         print("└" + "─" * 79 + "┘\n")
 
     def _get_user_input(self) -> str:
-        """Get user input."""
+        """Get user input safely."""
         while True:
-            choice = input("Select option: ").strip()
-            if choice:
-                return choice
-            print("Invalid input. Please try again.")
+            try:
+                choice = input("Select option: ").strip()
+                if choice:
+                    return choice
+                print("Invalid input. Please try again.")
+            except EOFError:
+                return '0'
 
     def _process_choice(self, choice: str) -> None:
-        """Process user choice."""
-        menu_items = self.menus.get(self.current_menu, {})
-        
-        if choice in menu_items:
-            _, callback = menu_items[choice]
-            try:
-                callback()
-            except Exception as e:
-                logger.error(f"Error executing command: {e}")
-                print(f"\n❌ Error: {e}\n")
+        """Process user choice with safety."""
+        with self._lock:
+            menu_items = self.menus.get(self.current_menu, {})
+            
+            if choice in menu_items:
+                _, callback = menu_items[choice]
+                try:
+                    callback()
+                except Exception as e:
+                    self.logger.error(f"Error executing command: {e}", exc_info=True)
+                    print(f"\n❌ Error: {e}\n")
+                    input("Press Enter to continue...")
+            else:
+                print("❌ Invalid option. Please try again.\n")
                 input("Press Enter to continue...")
-        else:
-            print("❌ Invalid option. Please try again.\n")
-            input("Press Enter to continue...")
 
     def _navigate_to(self, menu_name: str) -> None:
         """Navigate to different menu."""
-        if menu_name in self.menus:
-            self.current_menu = menu_name
-        else:
-            logger.warning(f"Menu '{menu_name}' not found")
+        with self._lock:
+            if menu_name in self.menus:
+                self.menu_history.append(menu_name)
+                self.current_menu = menu_name
+            else:
+                self.logger.warning(f"Menu '{menu_name}' not found")
 
     # ─────────────────────────────────────────────────────────────────────
     # BACKTEST CALLBACKS

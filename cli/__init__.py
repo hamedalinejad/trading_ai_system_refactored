@@ -1,13 +1,15 @@
 """
 CLI Package - Command-line interface for Trading AI System
 
-Exports:
+v79.1 Exports:
 - Interactive menu system
 - CLI commands
+- Command routing
 """
 
-from cli.menu_system import InteractiveMenu
-from cli.commands import (
+from .menu_system import InteractiveMenu, MenuOption
+from .commands import (
+    BaseCommand,
     BacktestCommand,
     TrainCommand,
     LiveCommand,
@@ -17,11 +19,20 @@ from cli.commands import (
 )
 
 __all__ = [
-    'InteractiveMenu',
-    'BacktestCommand',
-    'TrainCommand',
-    'LiveCommand',
-    'DataCommand',
-    'ConfigCommand',
-    'AnalysisCommand',
+    # Menu
+    "InteractiveMenu",
+    "MenuOption",
+    
+    # Base
+    "BaseCommand",
+    
+    # Commands
+    "BacktestCommand",
+    "TrainCommand",
+    "LiveCommand",
+    "DataCommand",
+    "ConfigCommand",
+    "AnalysisCommand",
 ]
+
+__version__ = "0.79.1"
