@@ -8,8 +8,9 @@ Supports:
 - Risk management and position sizing
 - Strategy development and backtesting
 - Data fetching and feature engineering
+- Automated indicator discovery and analysis
 
-v79.1 - Enhanced with better initialization and error handling
+v79.2 - Enhanced with indicator discovery and feature importance analysis
 """
 
 import sys
@@ -63,6 +64,12 @@ except ImportError as e:
     models = None
 
 try:
+    from trading_ai_system import discovery
+except ImportError as e:
+    logger.warning(f"Failed to import discovery module: {e}")
+    discovery = None
+
+try:
     from trading_ai_system import strategy
 except ImportError as e:
     logger.warning(f"Failed to import strategy module: {e}")
@@ -103,6 +110,7 @@ def get_system_info() -> dict:
         "data": data is not None,
         "features": features is not None,
         "models": models is not None,
+        "discovery": discovery is not None,
         "strategy": strategy is not None,
         "risk": risk is not None,
         "live": live is not None,
@@ -131,6 +139,7 @@ __all__ = [
     "data",
     "features",
     "models",
+    "discovery",
     "strategy",
     "risk",
     "live",
@@ -156,6 +165,7 @@ missing_modules = [name for name, loaded in {
     "data": data,
     "features": features,
     "models": models,
+    "discovery": discovery,
     "strategy": strategy,
     "risk": risk,
     "live": live,

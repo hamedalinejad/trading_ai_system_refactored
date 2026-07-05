@@ -1,6 +1,7 @@
 """
 Trading AI System - Features Module
 Feature engineering, technical indicators, and pattern detection.
+Enhanced with indicator discovery integration.
 """
 
 import sys
@@ -8,6 +9,7 @@ import logging
 from typing import Dict, Any, Optional, List, Tuple, Union
 from dataclasses import dataclass, field
 from threading import Lock
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,13 @@ except ImportError:
     HORIZON_MIN_BARS = {}
     BARS_PER_DAY_BY_TF = {}
 
+try:
+    from trading_ai_system.discovery import IndicatorDiscovery, IndicatorCategory
+    HAS_DISCOVERY = True
+except ImportError:
+    HAS_DISCOVERY = False
+    logger.warning("Indicator discovery module not available")
+
 
 class FeatureEngineeringError(FeatureError):
     pass
@@ -54,6 +63,7 @@ class FeatureMetadata:
     lookback: int = 1
     description: str = ""
     min_bars: int = 1
+    discovery_score: float = 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -62,8 +72,62 @@ class FeatureMetadata:
             "requires_shift": self.requires_shift,
             "lookback": self.lookback,
             "description": self.description,
-            "min_bars": self.min_bars
+            "min_bars": self.min_bars,
+            "discovery_score": self.discovery_score
         }
+
+
+class FeatureSelector:
+    """Select best features based on discovery results"""
+    
+    def __init__(self):
+        self.selected_features: Dict[str, FeatureMetadata] = {}
+        self.discovery_enabled = HAS_DISCOVERY
+        self._lock = Lock()
+    
+    def load_discovered_features(self, discovery_file: Path) -> None:
+        """Load features from discovery analysis"""
+        if not self.discovery_enabled:
+            logger.warning("Discovery module not available")
+            return
+        
+        try:
+            import json
+            with open(discovery_file, 'r') as f:
+                data = json.load(f)
+            
+            top_indicators = data.get('top_indicators', [])
+            
+            with self._lock:
+                for indicator_data in top_indicators:
+                    name = indicator_data.get('name')
+                    score = indicator_data.get('composite_score', 0.0)
+                    category = indicator_data.get('category', 'momentum')
+                    
+                    if name and score > 0:
+                        meta = FeatureMetadata(
+                            name=name,
+                            category=category,
+                            discovery_score=score
+                        )
+                        self.selected_features[name] = meta
+            
+            logger.info(f"Loaded {len(self.selected_features)} discovered features")
+        except Exception as e:
+            logger.error(f"Error loading discovered features: {e}")
+    
+    def get_selected_features(self) -> Dict[str, FeatureMetadata]:
+        """Get selected features"""
+        with self._lock:
+            return self.selected_features.copy()
+    
+    def is_feature_selected(self, feature_name: str) -> bool:
+        """Check if feature was selected by discovery"""
+        with self._lock:
+            return feature_name in self.selected_features
+
+
+feature_selector = FeatureSelector()
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -415,7 +479,9 @@ def calculate_returns(df: pd.DataFrame, tf: str = "1h") -> pd.DataFrame:
 def engineer_features_for_timeframe(
     df: pd.DataFrame,
     timeframe: str = "1h",
-    compute_advanced: bool = True
+    compute_advanced: bool = True,
+    use_discovery: bool = True,
+    discovery_config: Optional[Dict[str, Any]] = None
 ) -> Tuple[pd.DataFrame, Dict[str, FeatureMetadata]]:
     
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -501,6 +567,14 @@ def engineer_features_for_timeframe(
         except Exception as e:
             logger.warning(f"Failed to compute Stochastic: {e}")
     
+    if use_discovery and HAS_DISCOVERY:
+        try:
+            discovery = IndicatorDiscovery(**discovery_config) if discovery_config else IndicatorDiscovery()
+            discovered = discovery.discover_indicators(df_feat, target_column="return_1bar", min_score=0.5)
+            logger.info(f"Discovery: found {len(discovered)} high-performing indicators")
+        except Exception as e:
+            logger.warning(f"Indicator discovery failed: {e}")
+    
     feature_cols = [c for c in df_feat.columns if c not in df.columns]
     logger.info(f"engineer_features_for_timeframe: generated {len(feature_cols)} features")
     
@@ -509,11 +583,20 @@ def engineer_features_for_timeframe(
 
 __all__ = [
     'FeatureMetadata',
-    'FeatureEngineeringError', 'FeatureRegistrationError',
-    'compute_rsi', 'compute_macd', 'compute_bollinger_bands',
-    'compute_atr', 'compute_stochastic',
-    'detect_engulfing', 'detect_doji', 'detect_inside_bar',
-    'detect_three_bar_patterns', 'detect_morning_evening_star',
+    'FeatureSelector',
+    'FeatureEngineeringError',
+    'FeatureRegistrationError',
+    'compute_rsi',
+    'compute_macd',
+    'compute_bollinger_bands',
+    'compute_atr',
+    'compute_stochastic',
+    'detect_engulfing',
+    'detect_doji',
+    'detect_inside_bar',
+    'detect_three_bar_patterns',
+    'detect_morning_evening_star',
     'calculate_returns',
     'engineer_features_for_timeframe',
+    'feature_selector',
 ]

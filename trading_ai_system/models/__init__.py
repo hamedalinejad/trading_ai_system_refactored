@@ -1,12 +1,14 @@
 """
 Models Module - Machine learning models and predictions
 
-v79.1 Exports:
+v79.2 Exports:
 - Base model classes
 - LightGBM models
 - Ensemble methods
 - Meta models (stacking)
 - Model evaluation utilities
+- Feature importance analysis
+- Indicator discovery integration
 """
 
 from .models import (
@@ -14,6 +16,7 @@ from .models import (
     PredictionResult,
     ModelMetrics,
     ModelCheckpoint,
+    FeatureImportance,
     
     # Base Classes
     BaseModel,
@@ -31,6 +34,7 @@ from .models import (
     # Functions
     calculate_metrics,
     get_feature_importance,
+    get_discovered_features,
 )
 
 __all__ = [
@@ -38,6 +42,7 @@ __all__ = [
     "PredictionResult",
     "ModelMetrics",
     "ModelCheckpoint",
+    "FeatureImportance",
     
     # Base Classes
     "BaseModel",
@@ -55,6 +60,7 @@ __all__ = [
     # Functions
     "calculate_metrics",
     "get_feature_importance",
+    "get_discovered_features",
 ]
 
-__version__ = "0.79.1"
+__version__ = "0.79.2"
