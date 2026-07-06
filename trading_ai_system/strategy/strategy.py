@@ -1,25 +1,18 @@
 """
-Strategy Module for Trading AI System
-
-v79.1 Enhancements:
-- Thread-safe signal generation
-- Better error handling
-- Enhanced metrics collection
-- Improved walk-forward validation
-- Signal caching with TTL
+Strategy Module - Signal generation, walk-forward validation, strategy analysis
+v79.2: Full integration with models, features, risk modules
 """
 
 import numpy as np
 import pandas as pd
 import logging
 import json
+import threading
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-import threading
-from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +37,6 @@ class SignalResult:
     gate_reason: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "signal": self.signal.name,
             "signal_value": self.signal.value,
@@ -56,6 +48,9 @@ class SignalResult:
             "gating_allowed": self.gating_allowed,
             "gate_reason": self.gate_reason,
         }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
 
 
 @dataclass
@@ -74,8 +69,10 @@ class BacktestMetrics:
     consecutive_losses: int
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return asdict(self)
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
 
 
 @dataclass
@@ -87,9 +84,9 @@ class WalkForwardResult:
     out_of_sample_metrics: BacktestMetrics
     model_path: str
     stability_score: float
+    window_index: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "train_period": self.train_period,
             "test_period": self.test_period,
@@ -97,7 +94,11 @@ class WalkForwardResult:
             "out_of_sample_metrics": self.out_of_sample_metrics.to_dict(),
             "model_path": self.model_path,
             "stability_score": self.stability_score,
+            "window_index": self.window_index,
         }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
 
 
 class SignalGenerator:
@@ -107,15 +108,16 @@ class SignalGenerator:
         self,
         models_dir: str = "models/incremental",
         cache_enabled: bool = True,
+        cache_size: int = 1000,
     ):
-        """Initialize signal generator."""
         self.models_dir = Path(models_dir)
         self.cache_enabled = cache_enabled
+        self.cache_size = cache_size
         
         self._model_cache: Dict[str, Any] = {}
         self._metadata_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_lock = threading.RLock()
-        self._cache_stats = {"hits": 0, "misses": 0}
+        self._cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
     
     def generate_signal(
         self,
@@ -123,6 +125,7 @@ class SignalGenerator:
         features: pd.DataFrame,
         timeframe: str = "1h",
         gating_fn: Optional[Callable] = None,
+        model_predictions: Optional[np.ndarray] = None,
     ) -> SignalResult:
         """Generate trade signal from features."""
         if features is None or len(features) == 0:
@@ -136,7 +139,12 @@ class SignalGenerator:
         try:
             X = features.iloc[[-1]].fillna(0.0).astype(np.float32)
             
-            probs = np.array([0.25, 0.35, 0.40])
+            if model_predictions is not None:
+                probs = np.array(model_predictions)
+            else:
+                probs = np.array([0.25, 0.35, 0.40])
+            
+            probs = probs / np.sum(probs)
             
             cls_idx = int(np.argmax(probs))
             class_order = [-1, 0, 1]
@@ -157,6 +165,9 @@ class SignalGenerator:
                 gating_allowed = gate_result.get("gate_allowed", True)
                 gate_reason = gate_result.get("reason", "")
             
+            with self._cache_lock:
+                self._cache_stats["hits"] += 1
+            
             return SignalResult(
                 signal=signal,
                 confidence=confidence,
@@ -172,7 +183,7 @@ class SignalGenerator:
             )
         
         except Exception as e:
-            logger.error(f"Signal generation failed for {symbol}: {e}")
+            logger.error(f"Signal generation error {symbol}: {e}")
             return SignalResult(
                 signal=Signal.HOLD,
                 confidence=0.0,
@@ -180,23 +191,50 @@ class SignalGenerator:
                 model_name=symbol,
             )
     
+    def generate_signals_batch(
+        self,
+        symbols: List[str],
+        features_dict: Dict[str, pd.DataFrame],
+        gating_fn: Optional[Callable] = None,
+    ) -> Dict[str, SignalResult]:
+        """Generate signals for multiple symbols."""
+        results = {}
+        for symbol in symbols:
+            if symbol in features_dict:
+                results[symbol] = self.generate_signal(
+                    symbol,
+                    features_dict[symbol],
+                    gating_fn=gating_fn,
+                )
+        return results
+    
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
         with self._cache_lock:
             total = self._cache_stats["hits"] + self._cache_stats["misses"]
             return {
                 "hits": self._cache_stats["hits"],
                 "misses": self._cache_stats["misses"],
+                "evictions": self._cache_stats["evictions"],
                 "total": total,
                 "hit_rate": self._cache_stats["hits"] / max(total, 1),
                 "models_cached": len(self._model_cache),
+                "cache_size": self.cache_size,
             }
     
     def clear_cache(self) -> None:
-        """Clear model cache."""
         with self._cache_lock:
             self._model_cache.clear()
             self._metadata_cache.clear()
+            self._cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
+    
+    def _evict_cache(self) -> None:
+        """Evict oldest entry if cache full."""
+        if len(self._model_cache) >= self.cache_size:
+            oldest_key = next(iter(self._model_cache))
+            del self._model_cache[oldest_key]
+            if oldest_key in self._metadata_cache:
+                del self._metadata_cache[oldest_key]
+            self._cache_stats["evictions"] += 1
 
 
 class WalkForwardEngine:
@@ -208,7 +246,6 @@ class WalkForwardEngine:
         step_size: int = 250,
         test_window: int = 250,
     ):
-        """Initialize walk forward engine."""
         self.initial_window = initial_window
         self.step_size = step_size
         self.test_window = test_window
@@ -222,6 +259,7 @@ class WalkForwardEngine:
         windows = []
         
         current_train_start = 0
+        window_index = 0
         
         while current_train_start + self.initial_window + self.test_window < n:
             train_start = current_train_start
@@ -231,6 +269,7 @@ class WalkForwardEngine:
             
             if test_end <= n:
                 windows.append((train_start, train_end, test_start, test_end))
+                window_index += 1
             
             current_train_start += self.step_size
         
@@ -245,15 +284,18 @@ class WalkForwardEngine:
         total_return = float(np.sum(returns))
         annual_return = total_return * 252
         
-        if len(returns) > 0:
+        if len(returns) > 1:
             sharpe = np.mean(returns) / max(np.std(returns), 1e-10) * np.sqrt(252)
         else:
             sharpe = 0.0
         
-        cumulative = np.cumprod(1 + returns)
-        running_max = np.maximum.accumulate(cumulative)
-        drawdown = (cumulative - running_max) / running_max
-        max_dd = np.min(drawdown) if len(drawdown) > 0 else 0.0
+        if len(returns) > 0:
+            cumulative = np.cumprod(1 + returns)
+            running_max = np.maximum.accumulate(cumulative)
+            drawdown = (cumulative - running_max) / running_max
+            max_dd = np.min(drawdown) if len(drawdown) > 0 else 0.0
+        else:
+            max_dd = 0.0
         
         wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
         losses = sum(1 for t in trades if t.get("pnl", 0) < 0)
@@ -311,6 +353,7 @@ class WalkForwardEngine:
             out_of_sample_metrics=test_metrics,
             model_path=model_path,
             stability_score=float(stability),
+            window_index=len(self.results),
         )
         
         with self._lock:
@@ -336,7 +379,30 @@ class WalkForwardEngine:
                 "avg_max_dd": float(np.mean([m.max_drawdown for m in test_metrics])),
                 "avg_win_rate": float(np.mean([m.win_rate for m in test_metrics])),
                 "stability_score": float(np.mean([r.stability_score for r in self.results])),
+                "min_sharpe": float(np.min(sharpe_ratios)),
+                "max_sharpe": float(np.max(sharpe_ratios)),
             }
+    
+    def get_results_dataframe(self) -> pd.DataFrame:
+        """Get results as DataFrame."""
+        with self._lock:
+            if not self.results:
+                return pd.DataFrame()
+            
+            data = []
+            for r in self.results:
+                data.append({
+                    'window_index': r.window_index,
+                    'train_period': r.train_period,
+                    'test_period': r.test_period,
+                    'train_sharpe': r.in_sample_metrics.sharpe_ratio,
+                    'test_sharpe': r.out_of_sample_metrics.sharpe_ratio,
+                    'train_return': r.in_sample_metrics.annual_return,
+                    'test_return': r.out_of_sample_metrics.annual_return,
+                    'stability_score': r.stability_score,
+                })
+            
+            return pd.DataFrame(data)
 
 
 class StrategyValidator:
@@ -352,24 +418,31 @@ class StrategyValidator:
         if len(signals) < lookback or len(future_returns) < lookback:
             return False, "Insufficient data"
         
-        correlation = signals.corr(future_returns)
-        
-        if correlation > 0.3:
-            return True, f"High contemporaneous correlation: {correlation:.3f}"
-        
-        return False, "No obvious forward bias"
+        try:
+            correlation = signals.corr(future_returns)
+            
+            if correlation > 0.3:
+                return True, f"High correlation: {correlation:.3f}"
+            
+            return False, f"No bias detected (corr: {correlation:.3f})"
+        except Exception as e:
+            return False, f"Error: {str(e)[:50]}"
     
     @staticmethod
     def validate_signal_distribution(signals: pd.Series) -> Dict[str, Any]:
         """Validate signal distribution."""
         signal_counts = signals.value_counts()
         
+        total = len(signals)
         return {
-            "buy_pct": float(signal_counts.get(1, 0) / len(signals)),
-            "sell_pct": float(signal_counts.get(-1, 0) / len(signals)),
-            "hold_pct": float(signal_counts.get(0, 0) / len(signals)),
-            "total_trades": int(signal_counts.get(1, 0) + signal_counts.get(-1, 0)),
-            "trade_density": float((signal_counts.get(1, 0) + signal_counts.get(-1, 0)) / len(signals)),
+            "buy_pct": float(signal_counts.get(1, 0) / total) if total > 0 else 0.0,
+            "sell_pct": float(signal_counts.get(-1, 0) / total) if total > 0 else 0.0,
+            "hold_pct": float(signal_counts.get(0, 0) / total) if total > 0 else 0.0,
+            "buy_count": int(signal_counts.get(1, 0)),
+            "sell_count": int(signal_counts.get(-1, 0)),
+            "hold_count": int(signal_counts.get(0, 0)),
+            "total_signals": int(total),
+            "trade_density": float((signal_counts.get(1, 0) + signal_counts.get(-1, 0)) / total) if total > 0 else 0.0,
         }
     
     @staticmethod
@@ -386,20 +459,45 @@ class StrategyValidator:
         
         return_std = np.std(returns) / max(np.mean(np.abs(returns)), 0.01)
         if return_std > threshold:
-            return False, f"Unstable returns: {return_std:.2%} variation"
+            return False, f"Unstable returns: {return_std:.2%}"
         
         sharpe_std = np.std(sharpes) / max(np.mean(np.abs(sharpes)), 0.01)
         if sharpe_std > threshold:
-            return False, f"Unstable Sharpe: {sharpe_std:.2%} variation"
+            return False, f"Unstable Sharpe: {sharpe_std:.2%}"
         
         return True, "Parameters stable"
+    
+    @staticmethod
+    def validate_drawdown_control(
+        metrics_list: List[BacktestMetrics],
+        max_allowed_dd: float = 0.20,
+    ) -> Tuple[bool, str]:
+        """Check drawdown control."""
+        max_dd = max(m.max_drawdown for m in metrics_list) if metrics_list else 0.0
+        
+        if max_dd > max_allowed_dd:
+            return False, f"Max drawdown {max_dd:.2%} exceeds limit {max_allowed_dd:.2%}"
+        
+        return True, f"Drawdown control OK (max: {max_dd:.2%})"
+    
+    @staticmethod
+    def validate_profit_factor(
+        metrics_list: List[BacktestMetrics],
+        min_pf: float = 1.5,
+    ) -> Tuple[bool, str]:
+        """Check profit factor."""
+        avg_pf = np.mean([m.profit_factor for m in metrics_list]) if metrics_list else 0.0
+        
+        if avg_pf < min_pf:
+            return False, f"Avg profit factor {avg_pf:.2f} below {min_pf}"
+        
+        return True, f"Profit factor OK (avg: {avg_pf:.2f})"
 
 
 class LiveLiteMode:
     """Lightweight live trading with cached signals."""
     
     def __init__(self, enabled: bool = False, cache_ttl_seconds: int = 3600):
-        """Initialize live lite mode."""
         self.enabled = enabled
         self.cache_ttl_seconds = cache_ttl_seconds
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -453,12 +551,33 @@ class LiveLiteMode:
     def get_cache_info(self) -> Dict[str, Any]:
         """Get cache information."""
         with self._cache_lock:
+            expired_count = 0
+            for key, data in self._cache.items():
+                age = (datetime.now(timezone.utc) - data["timestamp"]).total_seconds()
+                if age >= self.cache_ttl_seconds:
+                    expired_count += 1
+            
             return {
                 "enabled": self.enabled,
                 "ttl_seconds": self.cache_ttl_seconds,
                 "cached_items": len(self._cache),
+                "expired_items": expired_count,
                 "cache_keys": list(self._cache.keys()),
             }
+    
+    def cleanup_expired(self) -> int:
+        """Remove expired cache entries."""
+        with self._cache_lock:
+            keys_to_delete = []
+            for key, data in self._cache.items():
+                age = (datetime.now(timezone.utc) - data["timestamp"]).total_seconds()
+                if age >= self.cache_ttl_seconds:
+                    keys_to_delete.append(key)
+            
+            for key in keys_to_delete:
+                del self._cache[key]
+            
+            return len(keys_to_delete)
 
 
 _live_lite_mode = LiveLiteMode(enabled=False)

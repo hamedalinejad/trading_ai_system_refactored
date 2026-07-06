@@ -1,51 +1,32 @@
 """
-Strategy Module - Trading strategies and signal generation
-
-v79.1 Exports:
-- Signal generation
-- Walk-forward validation
-- Strategy validation
-- Live trading caching
+Strategy Module - Signal generation, walk-forward validation, strategy analysis
+v79.2: Full integration with models, features, risk modules
 """
 
 from .strategy import (
-    # Enums
     Signal,
-    
-    # Data Classes
     SignalResult,
     BacktestMetrics,
     WalkForwardResult,
-    
-    # Classes
     SignalGenerator,
     WalkForwardEngine,
     StrategyValidator,
     LiveLiteMode,
-    
-    # Functions
     get_signal_generator,
     get_live_lite_mode,
 )
 
 __all__ = [
-    # Enums
     "Signal",
-    
-    # Data Classes
     "SignalResult",
     "BacktestMetrics",
     "WalkForwardResult",
-    
-    # Classes
     "SignalGenerator",
     "WalkForwardEngine",
     "StrategyValidator",
     "LiveLiteMode",
-    
-    # Functions
     "get_signal_generator",
     "get_live_lite_mode",
 ]
 
-__version__ = "0.79.1"
+__version__ = "0.79.2"

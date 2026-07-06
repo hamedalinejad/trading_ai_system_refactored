@@ -1,15 +1,6 @@
 """
-Trading AI System - Models Module
-Machine learning models, ensemble methods, and prediction infrastructure.
-
-v79.2 Enhancements:
-- Thread-safe model management
-- Better error handling for optional dependencies
-- Model versioning and checkpointing
-- Cross-validation support
-- Advanced ensemble techniques
-- Feature importance analysis
-- Indicator discovery integration
+Trading AI System - Models Module (v79.2)
+ML models, ensemble methods, prediction infrastructure
 """
 
 import sys
@@ -42,7 +33,7 @@ except ImportError:
 
 @dataclass
 class FeatureImportance:
-    """Feature importance analysis result"""
+    """Feature importance analysis result."""
     feature_name: str
     importance_score: float
     normalized_score: float = 0.0
@@ -59,6 +50,9 @@ class FeatureImportance:
             "category": self.category,
             "discovered": self.discovered
         }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
 
 
 class ModelError(TradingSystemError):
@@ -91,7 +85,6 @@ class PredictionResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "prediction": self.prediction,
             "probability": self.probability,
@@ -99,6 +92,9 @@ class PredictionResult:
             "model_name": self.model_name,
             "metadata": self.metadata
         }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
 
 
 @dataclass
@@ -116,7 +112,6 @@ class ModelMetrics:
     feature_importance: Dict[str, float] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "accuracy": self.accuracy,
             "precision": self.precision,
@@ -130,8 +125,10 @@ class ModelMetrics:
             "feature_importance": self.feature_importance,
         }
     
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
+    
     def is_valid(self) -> bool:
-        """Check if metrics are valid."""
         return (0 <= self.accuracy <= 1 and 
                 0 <= self.precision <= 1 and 
                 0 <= self.recall <= 1)
@@ -147,7 +144,6 @@ class ModelCheckpoint:
     feature_importance: Dict[str, FeatureImportance] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "timestamp": self.timestamp.isoformat(),
             "version": self.version,
@@ -155,13 +151,15 @@ class ModelCheckpoint:
             "params": self.params,
             "feature_importance": {k: v.to_dict() for k, v in self.feature_importance.items()},
         }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
 
 
 class BaseModel(ABC):
     """Abstract base class for all models."""
     
     def __init__(self, name: str, version: str = "1.0"):
-        """Initialize model."""
         self.name = name
         self.version = version
         self.is_trained = False
@@ -237,6 +235,7 @@ class BaseModel(ABC):
             metrics=metrics or self.metrics,
             feature_importance=self.feature_importance.copy()
         )
+        
         with self._lock:
             self.checkpoints.append(checkpoint)
         logger.info(f"Checkpoint created for {self.name} v{self.version}")
@@ -260,7 +259,6 @@ class LightGBMModel(BaseModel):
     """LightGBM model wrapper."""
     
     def __init__(self, name: str = "lgb_model", version: str = "1.0", **kwargs):
-        """Initialize LightGBM model."""
         super().__init__(name, version)
         self.model = None
         self.params = kwargs
@@ -341,7 +339,6 @@ class EnsembleModel(BaseModel):
     """Ensemble of multiple models."""
     
     def __init__(self, name: str = "ensemble", models: Optional[List[BaseModel]] = None, version: str = "1.0"):
-        """Initialize ensemble."""
         super().__init__(name, version)
         self.models = models or []
         self.weights = [1.0 / len(self.models)] if self.models else []
@@ -426,7 +423,6 @@ class MetaModel(BaseModel):
         meta_learner: Optional[BaseModel] = None,
         version: str = "1.0"
     ):
-        """Initialize meta model."""
         super().__init__(name, version)
         self.base_models = base_models or []
         self.meta_learner = meta_learner or LightGBMModel("meta_lgb")
@@ -503,7 +499,6 @@ class IsotonicCalibrator(BaseModel):
     """Isotonic regression calibration."""
     
     def __init__(self, name: str = "isotonic_calibrator", version: str = "1.0"):
-        """Initialize calibrator."""
         super().__init__(name, version)
         self.calibrator = None
     
