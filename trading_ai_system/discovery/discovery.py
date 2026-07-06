@@ -13,7 +13,7 @@ Critical Fixes Applied:
 """
 
 import logging
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Optional, List, Tuple, Set, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
@@ -21,7 +21,7 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from itertools import combinations
+from itertools import combinations, product
 from threading import Lock
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
@@ -50,6 +50,21 @@ class PatternType(Enum):
     TREND_LINE = "trend_line"
     DIVERGENCE = "divergence"
     BREAKOUT = "breakout"
+
+
+@dataclass
+class IndicatorDefinition:
+    """Definition for automatic indicator generation"""
+    name: str
+    category: IndicatorCategory
+    compute_func: Callable[[pd.DataFrame, Dict[str, Any]], pd.Series]
+    param_grid: Dict[str, List[Any]]
+    
+    def generate_param_combinations(self) -> List[Dict[str, Any]]:
+        """Generate all parameter combinations from grid"""
+        keys = self.param_grid.keys()
+        for values in product(*self.param_grid.values()):
+            yield dict(zip(keys, values))
 
 
 @dataclass
@@ -265,7 +280,52 @@ class Discovery:
         self._indicator_cache: Dict[str, Any] = {}
         self._lock = Lock()
         self.discovery_history: List[Dict[str, Any]] = []
+        self._indicator_definitions: Dict[str, IndicatorDefinition] = {}
         logger.info(f"Discovery initialized with config: {self.config.to_dict()}")
+    
+    # ==================== INDICATOR DEFINITION MANAGEMENT ====================
+    
+    def register_indicator(self, definition: IndicatorDefinition) -> None:
+        """Register an indicator definition"""
+        self._indicator_definitions[definition.name] = definition
+    
+    def generate_and_discover_indicators(
+        self, df: pd.DataFrame, target_column: str = "returns", min_score: float = 0.5
+    ) -> Dict[str, IndicatorMetric]:
+        """Generate indicators from definitions and discover high-scoring ones"""
+        results = {}
+        for name, definition in self._indicator_definitions.items():
+            for params in definition.generate_param_combinations():
+                param_str = '_'.join(f'{k}{v}' for k, v in params.items())
+                col_name = f"{name}_{param_str}"
+                if col_name not in df.columns:
+                    df[col_name] = definition.compute_func(df, params)
+                metric = self.analyze_indicator_performance(df, col_name, definition.category, target_column)
+                if metric and metric.composite_score() >= min_score:
+                    results[col_name] = metric
+        return results
+    
+    def optimize_indicator_parameters_advanced(
+        self, df: pd.DataFrame, indicator_definition: IndicatorDefinition,
+        target_column: str = "returns", scoring: str = "composite_score"
+    ) -> Dict[str, Any]:
+        """Advanced parameter optimization using grid search"""
+        best_score = -np.inf
+        best_params = {}
+        best_metric = None
+        for params in indicator_definition.generate_param_combinations():
+            param_str = '_'.join(f'{k}{v}' for k, v in params.items())
+            col_name = f"{indicator_definition.name}_{param_str}"
+            if col_name not in df.columns:
+                df[col_name] = indicator_definition.compute_func(df, params)
+            metric = self.analyze_indicator_performance(df, col_name, indicator_definition.category, target_column)
+            if metric:
+                score = getattr(metric, scoring, metric.composite_score())
+                if score > best_score:
+                    best_score = score
+                    best_params = params
+                    best_metric = metric
+        return {"best_params": best_params, "best_score": best_score, "metric": best_metric}
     
     # ==================== INDICATOR ANALYSIS ====================
     
@@ -1448,4 +1508,5 @@ __all__ = [
     'IndicatorCombination',
     'IndicatorCategory',
     'PatternType',
+    'IndicatorDefinition',
 ]

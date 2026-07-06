@@ -5,6 +5,7 @@ from trading_ai_system.discovery.discovery import (
     IndicatorCombination,
     IndicatorCategory,
     PatternType,
+    IndicatorDefinition,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     'IndicatorCombination',
     'IndicatorCategory',
     'PatternType',
+    'IndicatorDefinition',
 ]
