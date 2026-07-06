@@ -64,31 +64,124 @@ def _get_scaler(scaler_type: str = 'standard'):
         return StandardScaler()
 
 
-def _interpolate_missing_values(df: pd.DataFrame, timeframe: str = '1h', fill_method: str = 'interpolate') -> pd.DataFrame:
-    """Handle missing values with reindex and interpolation"""
+def _detect_data_gaps(df: pd.DataFrame, timeframe: str = '1h') -> Dict[str, Any]:
+    """
+    Detect missing data gaps in DataFrame.
+    
+    Args:
+        df: Input DataFrame with DatetimeIndex
+        timeframe: Expected timeframe
+        
+    Returns:
+        Dictionary with gap statistics
+    """
+    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return {'total_gaps': 0, 'max_gap_hours': 0, 'gap_rows': []}
+    
+    try:
+        freq_map = {
+            '1m': 1/60, '5m': 5/60, '15m': 15/60, '30m': 30/60,
+            '1h': 1, '4h': 4, '1d': 24, '1w': 168, '1M': 730
+        }
+        expected_interval_hours = freq_map.get(timeframe, 1)
+        
+        time_diffs = df.index.to_series().diff().dt.total_seconds() / 3600
+        gaps = time_diffs[time_diffs > expected_interval_hours * 1.5]
+        
+        return {
+            'total_gaps': len(gaps),
+            'max_gap_hours': gaps.max() if len(gaps) > 0 else 0,
+            'avg_gap_hours': gaps.mean() if len(gaps) > 0 else 0,
+            'gap_indices': gaps.index.tolist()
+        }
+    except Exception as e:
+        logger.warning(f"Gap detection failed: {e}")
+        return {'total_gaps': 0, 'max_gap_hours': 0, 'gap_rows': []}
+
+
+def _interpolate_missing_values(df: pd.DataFrame, timeframe: str = '1h', fill_method: str = 'interpolate', max_gap: int = None) -> pd.DataFrame:
+    """
+    Handle missing values with reindex and interpolation.
+    
+    Args:
+        df: Input DataFrame
+        timeframe: Expected timeframe ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w', '1M')
+        fill_method: 'interpolate', 'ffill', or 'both'
+        max_gap: Maximum gap size (in bars) to interpolate. Larger gaps kept as NaN
+        
+    Returns:
+        DataFrame with missing values handled
+    """
     if df.empty:
         return df
     
     try:
-        if fill_method == 'interpolate':
-            freq_map = {
-                '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min',
-                '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w', '1M': '1MS'
-            }
-            freq = freq_map.get(timeframe, '1h')
-            
-            full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
-            df_reindexed = df.reindex(full_index)
-            
-            ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
-            available_cols = [c for c in ohlcv_cols if c in df_reindexed.columns]
-            
+        freq_map = {
+            '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min',
+            '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w', '1M': '1MS'
+        }
+        freq = freq_map.get(timeframe, '1h')
+        
+        # Create full date range based on timeframe
+        full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
+        df_reindexed = df.reindex(full_index)
+        
+        ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+        available_cols = [c for c in ohlcv_cols if c in df_reindexed.columns]
+        
+        if fill_method in ['interpolate', 'both']:
             for col in available_cols:
-                df_reindexed[col] = df_reindexed[col].interpolate(method='time', limit_direction='both')
-            
-            return df_reindexed
+                if col == 'volume':
+                    # Volume: use forward fill then interpolate
+                    df_reindexed[col] = df_reindexed[col].fillna(method='ffill')
+                    df_reindexed[col] = df_reindexed[col].interpolate(method='linear', limit_direction='both')
+                    df_reindexed[col] = df_reindexed[col].fillna(0)
+                else:
+                    # OHLC: use linear interpolation with limit_area
+                    nan_mask = df_reindexed[col].isna()
+                    
+                    if max_gap:
+                        # Identify continuous NaN blocks
+                        nan_groups = (nan_mask != nan_mask.shift()).cumsum()[nan_mask]
+                        max_gap_size = nan_mask.groupby((nan_mask != nan_mask.shift()).cumsum()).sum().max()
+                        
+                        # Only interpolate gaps smaller than max_gap
+                        if max_gap_size <= max_gap:
+                            df_reindexed[col] = df_reindexed[col].interpolate(
+                                method='linear',
+                                limit_direction='both',
+                                limit_area='inside'
+                            )
+                    else:
+                        # Interpolate all gaps
+                        df_reindexed[col] = df_reindexed[col].interpolate(
+                            method='linear',
+                            limit_direction='both',
+                            limit_area='inside'
+                        )
+                    
+                    # Forward fill remaining NaNs at start
+                    df_reindexed[col] = df_reindexed[col].fillna(method='ffill')
+                    # Backward fill remaining NaNs at end
+                    df_reindexed[col] = df_reindexed[col].fillna(method='bfill')
+        
+        elif fill_method == 'ffill':
+            # Simple forward fill without interpolation
+            for col in available_cols:
+                df_reindexed[col] = df_reindexed[col].fillna(method='ffill')
+                df_reindexed[col] = df_reindexed[col].fillna(method='bfill')
+        
+        logger.debug(f"Interpolation completed: {len(df)} → {len(df_reindexed)} rows, "
+                    f"filled {df_reindexed.isna().sum().sum()} NaN cells")
+        
+        return df_reindexed
+    
     except Exception as e:
-        logger.warning(f"Interpolation failed: {e}")
+        logger.warning(f"Interpolation failed: {e}. Using forward fill instead.")
+        # Fallback: simple forward fill
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df.columns:
+                df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
     
     return df
 
@@ -119,6 +212,75 @@ class FeatureMetadata:
             "min_bars": self.min_bars,
             "discovery_score": self.discovery_score
         }
+
+
+def validate_ohlcv_data(df: pd.DataFrame, timeframe: str = '1h', strict: bool = False) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Validate OHLCV data integrity and continuity.
+    
+    Args:
+        df: Input DataFrame
+        timeframe: Expected timeframe
+        strict: If True, fail on any quality issues
+        
+    Returns:
+        Tuple of (is_valid, validation_report)
+    """
+    report = {
+        'is_valid': True,
+        'warnings': [],
+        'errors': [],
+        'stats': {}
+    }
+    
+    try:
+        # Check basic structure
+        required = ['open', 'high', 'low', 'close', 'volume']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            report['errors'].append(f"Missing columns: {missing}")
+            report['is_valid'] = False
+        
+        if df.empty:
+            report['errors'].append("DataFrame is empty")
+            report['is_valid'] = False
+            return False, report
+        
+        # Check for data gaps
+        gaps = _detect_data_gaps(df, timeframe)
+        report['stats']['gaps'] = gaps
+        if gaps['total_gaps'] > 0:
+            msg = f"Found {gaps['total_gaps']} gaps (max: {gaps['max_gap_hours']:.1f}h)"
+            if gaps['max_gap_hours'] > 24:
+                report['warnings'].append(msg)
+            else:
+                report['warnings'].append(msg)
+        
+        # Check for NaN percentage
+        nan_pct = df[required].isna().sum().sum() / (len(df) * len(required)) * 100
+        report['stats']['nan_percentage'] = nan_pct
+        if nan_pct > 20:
+            report['warnings'].append(f"High NaN percentage: {nan_pct:.1f}%")
+        
+        # Check for OHLC logical consistency
+        for idx, row in df.iterrows():
+            if row['high'] < row['low']:
+                report['errors'].append(f"Invalid OHLC at {idx}: high < low")
+                report['is_valid'] = False
+            if row['high'] < row['open'] or row['high'] < row['close']:
+                report['warnings'].append(f"Potential data issue at {idx}: high < open/close")
+            if row['low'] > row['open'] or row['low'] > row['close']:
+                report['warnings'].append(f"Potential data issue at {idx}: low > open/close")
+        
+        if strict and report['warnings']:
+            report['is_valid'] = False
+        
+        return report['is_valid'], report
+        
+    except Exception as e:
+        report['errors'].append(f"Validation error: {str(e)}")
+        report['is_valid'] = False
+        return False, report
 
 
 class FeatureSelector:
@@ -413,6 +575,238 @@ def compute_stochastic(
         logger.error(f"Error computing Stochastic: {e}")
         idx = high.index if isinstance(high, pd.Series) else None
         return pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx)
+
+
+def compute_adx(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate ADX (Average Directional Index).
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        period: ADX period (default 14)
+        
+    Returns:
+        Tuple of (ADX, +DI, -DI)
+    """
+    if not all(isinstance(s, pd.Series) for s in [high, low, close]):
+        idx = high.index if isinstance(high, pd.Series) else None
+        return (pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx))
+    
+    if len(high) < period:
+        idx = high.index
+        return (pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx))
+    
+    try:
+        high = high.astype(float)
+        low = low.astype(float)
+        close = close.astype(float)
+        
+        plus_dm = high.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm = low.diff() * -1
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(period, min_periods=1).mean()
+        
+        plus_di = 100 * (plus_dm.rolling(period, min_periods=1).mean() / (atr + 1e-10))
+        minus_di = 100 * (minus_dm.rolling(period, min_periods=1).mean() / (atr + 1e-10))
+        
+        di_diff = (plus_di - minus_di).abs()
+        di_sum = plus_di + minus_di
+        di_sum = di_sum.replace(0, 1e-10)
+        dx = 100 * (di_diff / (di_sum + 1e-10))
+        adx = dx.rolling(period, min_periods=1).mean()
+        
+        return adx.fillna(25.0), plus_di.fillna(25.0), minus_di.fillna(25.0)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error computing ADX: {e}")
+        idx = high.index if isinstance(high, pd.Series) else None
+        return (pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx))
+
+
+def compute_cci(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 20
+) -> pd.Series:
+    """
+    Calculate CCI (Commodity Channel Index).
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        period: CCI period (default 20)
+        
+    Returns:
+        CCI values
+    """
+    if not all(isinstance(s, pd.Series) for s in [high, low, close]):
+        return pd.Series(np.nan, index=high.index if isinstance(high, pd.Series) else None)
+    
+    if len(high) < period:
+        return pd.Series(np.nan, index=high.index)
+    
+    try:
+        high = high.astype(float)
+        low = low.astype(float)
+        close = close.astype(float)
+        
+        typical_price = (high + low + close) / 3
+        sma = typical_price.rolling(window=period, min_periods=1).mean()
+        mad = typical_price.rolling(window=period, min_periods=1).apply(lambda x: (x - x.mean()).abs().mean())
+        mad = mad.replace(0, 1e-10)
+        
+        cci = (typical_price - sma) / (0.015 * mad + 1e-10)
+        
+        return cci.fillna(0.0)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error computing CCI: {e}")
+        return pd.Series(np.nan, index=high.index)
+
+
+def compute_obv(
+    close: pd.Series,
+    volume: pd.Series
+) -> pd.Series:
+    """
+    Calculate OBV (On-Balance Volume).
+    
+    Args:
+        close: Close price series
+        volume: Volume series
+        
+    Returns:
+        OBV values
+    """
+    if not all(isinstance(s, pd.Series) for s in [close, volume]):
+        return pd.Series(np.nan, index=close.index if isinstance(close, pd.Series) else None)
+    
+    if len(close) < 2:
+        return pd.Series(np.nan, index=close.index)
+    
+    try:
+        close = close.astype(float)
+        volume = volume.astype(float)
+        
+        obv = pd.Series(0.0, index=close.index)
+        for i in range(1, len(close)):
+            if close.iloc[i] > close.iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
+            elif close.iloc[i] < close.iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
+            else:
+                obv.iloc[i] = obv.iloc[i-1]
+        
+        return obv.fillna(0.0)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error computing OBV: {e}")
+        return pd.Series(np.nan, index=close.index)
+
+
+def compute_ichimoku(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate Ichimoku Cloud indicators.
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        
+    Returns:
+        Tuple of (Tenkan-sen, Kijun-sen, Senkou Span A, Senkou Span B)
+    """
+    if not all(isinstance(s, pd.Series) for s in [high, low, close]):
+        idx = high.index if isinstance(high, pd.Series) else None
+        return (pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx), 
+                pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx))
+    
+    if len(high) < 52:
+        idx = high.index
+        return (pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx),
+                pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx))
+    
+    try:
+        high = high.astype(float)
+        low = low.astype(float)
+        close = close.astype(float)
+        
+        tenkan_high = high.rolling(window=9, min_periods=1).max()
+        tenkan_low = low.rolling(window=9, min_periods=1).min()
+        tenkan = (tenkan_high + tenkan_low) / 2
+        
+        kijun_high = high.rolling(window=26, min_periods=1).max()
+        kijun_low = low.rolling(window=26, min_periods=1).min()
+        kijun = (kijun_high + kijun_low) / 2
+        
+        senkou_a = ((tenkan + kijun) / 2).shift(26)
+        
+        senkou_b_high = high.rolling(window=52, min_periods=1).max()
+        senkou_b_low = low.rolling(window=52, min_periods=1).min()
+        senkou_b = ((senkou_b_high + senkou_b_low) / 2).shift(26)
+        
+        return tenkan.fillna(close), kijun.fillna(close), senkou_a.fillna(close), senkou_b.fillna(close)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error computing Ichimoku: {e}")
+        idx = high.index if isinstance(high, pd.Series) else None
+        return (pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx),
+                pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx))
+
+
+def compute_williams_r(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14
+) -> pd.Series:
+    """
+    Calculate Williams %R.
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        period: Williams %R period (default 14)
+        
+    Returns:
+        Williams %R values (-100 to 0)
+    """
+    if not all(isinstance(s, pd.Series) for s in [high, low, close]):
+        return pd.Series(np.nan, index=high.index if isinstance(high, pd.Series) else None)
+    
+    if len(high) < period:
+        return pd.Series(np.nan, index=high.index)
+    
+    try:
+        high = high.astype(float)
+        low = low.astype(float)
+        close = close.astype(float)
+        
+        highest_high = high.rolling(window=period, min_periods=1).max()
+        lowest_low = low.rolling(window=period, min_periods=1).min()
+        
+        range_val = highest_high - lowest_low
+        range_val = range_val.replace(0, 1e-10)
+        
+        williams_r = -100 * ((highest_high - close) / (range_val + 1e-10))
+        
+        return williams_r.fillna(-50.0)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error computing Williams %R: {e}")
+        return pd.Series(np.nan, index=high.index)
 
 
 # ==================== PATTERN DETECTION FUNCTIONS ====================
@@ -833,6 +1227,59 @@ def engineer_features_for_timeframe(
                 ])
             except ValueError as e:
                 logger.warning(f"Failed to compute Stochastic: {e}")
+            
+            try:
+                adx, plus_di, minus_di = compute_adx(df_feat["high"], df_feat["low"], df_feat["close"])
+                df_feat["adx_14"] = adx
+                df_feat["plus_di"] = plus_di
+                df_feat["minus_di"] = minus_di
+                generated_features.extend([
+                    ("adx_14", "trend"),
+                    ("plus_di", "trend"),
+                    ("minus_di", "trend")
+                ])
+            except ValueError as e:
+                logger.warning(f"Failed to compute ADX: {e}")
+            
+            try:
+                cci = compute_cci(df_feat["high"], df_feat["low"], df_feat["close"])
+                df_feat["cci_20"] = cci
+                generated_features.append(("cci_20", "momentum"))
+            except ValueError as e:
+                logger.warning(f"Failed to compute CCI: {e}")
+            
+            try:
+                obv = compute_obv(df_feat["close"], df_feat["volume"])
+                df_feat["obv"] = obv
+                df_feat["obv_sma"] = obv.rolling(20, min_periods=1).mean()
+                generated_features.extend([
+                    ("obv", "volume"),
+                    ("obv_sma", "volume")
+                ])
+            except ValueError as e:
+                logger.warning(f"Failed to compute OBV: {e}")
+            
+            try:
+                tenkan, kijun, senkou_a, senkou_b = compute_ichimoku(df_feat["high"], df_feat["low"], df_feat["close"])
+                df_feat["ichimoku_tenkan"] = tenkan
+                df_feat["ichimoku_kijun"] = kijun
+                df_feat["ichimoku_senkou_a"] = senkou_a
+                df_feat["ichimoku_senkou_b"] = senkou_b
+                generated_features.extend([
+                    ("ichimoku_tenkan", "trend"),
+                    ("ichimoku_kijun", "trend"),
+                    ("ichimoku_senkou_a", "trend"),
+                    ("ichimoku_senkou_b", "trend")
+                ])
+            except ValueError as e:
+                logger.warning(f"Failed to compute Ichimoku: {e}")
+            
+            try:
+                williams_r = compute_williams_r(df_feat["high"], df_feat["low"], df_feat["close"])
+                df_feat["williams_r"] = williams_r
+                generated_features.append(("williams_r", "momentum"))
+            except ValueError as e:
+                logger.warning(f"Failed to compute Williams %R: {e}")
         
         # ==================== VOLATILITY INDICATORS ====================
         
@@ -937,7 +1384,20 @@ def engineer_features_for_timeframe(
         
         # ==================== DISCOVERY-DRIVEN FEATURE FILTERING ====================
         
-        # If discovery was used, only keep selected features + OHLCV
+        # If discovery was used, sync with feature selector and filter
+        if discovered_features and HAS_DISCOVERY:
+            try:
+                for name, score in discovered_features.items():
+                    meta = FeatureMetadata(
+                        name=name,
+                        category='discovered',
+                        discovery_score=score
+                    )
+                    feature_selector.selected_features[name] = meta
+            except Exception as e:
+                logger.debug(f"Failed to sync with feature selector: {e}")
+        
+        # Filter to keep only discovered features + OHLCV
         if discovered_features:
             discovery_feature_names = list(discovered_features.keys())
             generated_feature_names = [f[0] for f in generated_features]
@@ -956,14 +1416,26 @@ def engineer_features_for_timeframe(
         
         # ==================== FIX #1.2: COMPREHENSIVE NAN/INF HANDLING ====================
         
-        # Fill NaN values
+        # Handle missing values with advanced interpolation before normalization
         numeric_cols = df_feat.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            if col not in required_cols:
-                df_feat[col] = df_feat[col].fillna(method='ffill').fillna(0)
         
-        # Replace any remaining Inf values
+        for col in numeric_cols:
+            if col in required_cols:
+                # OHLCV: use interpolation
+                nan_count = df_feat[col].isna().sum()
+                if nan_count > 0:
+                    df_feat[col] = df_feat[col].interpolate(method='linear', limit_direction='both')
+                    df_feat[col] = df_feat[col].fillna(method='ffill').fillna(method='bfill')
+            else:
+                # Indicators: forward fill then backward fill
+                if df_feat[col].isna().any():
+                    df_feat[col] = df_feat[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        # Replace any Inf values
         df_feat = df_feat.replace([np.inf, -np.inf], 0)
+        
+        # Final NaN safety check
+        df_feat = df_feat.fillna(0)
         
         # ==================== OPTIONAL NORMALIZATION ====================
         
@@ -1023,6 +1495,11 @@ __all__ = [
     'compute_bollinger_bands',
     'compute_atr',
     'compute_stochastic',
+    'compute_adx',
+    'compute_cci',
+    'compute_obv',
+    'compute_ichimoku',
+    'compute_williams_r',
     'detect_engulfing',
     'detect_doji',
     'detect_inside_bar',
