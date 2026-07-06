@@ -28,7 +28,11 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 try:
     from trading_ai_system.core import get_logger
     logger = get_logger(__name__)
-except ImportError:
+except (ImportError, AttributeError):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     logger = logging.getLogger(__name__)
 
 
