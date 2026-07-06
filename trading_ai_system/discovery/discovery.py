@@ -504,6 +504,72 @@ class Discovery:
         logger.info(f"Discovered {len(discovered)} indicators with score >= {min_score}")
         return discovered
     
+    def discover_with_horizons(
+        self, df: pd.DataFrame, horizons: Optional[List[int]] = None, min_score: float = 0.5
+    ) -> Dict[int, Dict[str, IndicatorMetric]]:
+        """Discover indicators across multiple time horizons"""
+        if horizons is None:
+            horizons = [1, 3, 5, 10]
+        
+        results = {}
+        for h in horizons:
+            target_col = f"returns_{h}bar"
+            if target_col not in df.columns:
+                df[target_col] = df['close'].pct_change(h).shift(-h)
+            results[h] = self.discover_indicators(df, target_column=target_col, min_score=min_score)
+        
+        logger.info(f"Discovered indicators for {len(horizons)} horizons")
+        return results
+    
+    def optimize_combination_weights(
+        self, df: pd.DataFrame, indicators: List[str], target_column: str = "returns",
+        num_weights: int = 10, use_walk_forward: bool = True
+    ) -> Dict[str, Any]:
+        """Find optimal weights for indicator combination (instead of equal weights)"""
+        if len(indicators) < 2:
+            return {"weights": {ind: 1.0 for ind in indicators}, "score": 0.0}
+        
+        best_score = -np.inf
+        best_weights = {ind: 1.0 / len(indicators) for ind in indicators}
+        
+        try:
+            weight_grid = np.linspace(0.0, 1.0, num_weights)
+            
+            for weights_tuple in self._generate_weight_combinations(len(indicators), weight_grid):
+                weights = {ind: w for ind, w in zip(indicators, weights_tuple)}
+                
+                if all(ind in df.columns for ind in indicators):
+                    signals = np.zeros(len(df))
+                    for ind, weight in weights.items():
+                        signals += df[ind].values * weight
+                    
+                    metric = self._calculate_signal_quality(signals, df[target_column].values)
+                    
+                    if metric > best_score:
+                        best_score = metric
+                        best_weights = weights
+            
+            return {
+                "weights": best_weights,
+                "score": best_score,
+                "indicators": indicators
+            }
+        
+        except Exception as e:
+            logger.error(f"Error optimizing combination weights: {e}")
+            return {"weights": {ind: 1.0 / len(indicators) for ind in indicators}, "score": 0.0}
+    
+    def _generate_weight_combinations(self, n_indicators: int, weight_grid: np.ndarray) -> List[Tuple]:
+        """Generate weight combinations that sum to 1"""
+        combinations_list = []
+        for weights in np.ndindex(tuple([len(weight_grid)] * n_indicators)):
+            w = np.array([weight_grid[i] for i in weights])
+            w_sum = np.sum(w)
+            if w_sum > 0:
+                w = w / w_sum
+                combinations_list.append(tuple(w))
+        return combinations_list
+    
     def optimize_indicator_parameters(
         self,
         df: pd.DataFrame,
@@ -830,6 +896,81 @@ class Discovery:
         
         except Exception as e:
             logger.error(f"Error detecting S/R: {e}")
+            return {}
+    
+    def detect_breakouts(
+        self, df: pd.DataFrame, target_column: str = "returns",
+        lookback: int = 20, threshold: float = 0.02
+    ) -> Dict[str, PatternMetric]:
+        """Detect breakouts above resistance or below support"""
+        if df.empty or 'close' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
+            return {}
+        
+        patterns = {}
+        try:
+            resistance = df['high'].rolling(lookback).max().shift(1)
+            support = df['low'].rolling(lookback).min().shift(1)
+            
+            upbreak = (df['close'] > resistance) & ((df['close'] - resistance) / resistance > threshold)
+            downbreak = (df['close'] < support) & ((support - df['close']) / support > threshold)
+            
+            for name, signal in [('upbreak', upbreak), ('downbreak', downbreak)]:
+                metrics = self._calculate_pattern_metrics(signal.astype(int), df[target_column])
+                patterns[name] = PatternMetric(
+                    name=f"breakout_{name}",
+                    pattern_type=PatternType.BREAKOUT,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+            
+            logger.info(f"Detected {sum(1 for v in patterns.values() if v.occurrence_count > 0)} breakout patterns")
+            return {k: v for k, v in patterns.items() if v.occurrence_count > 0}
+        
+        except Exception as e:
+            logger.error(f"Error detecting breakouts: {e}")
+            return {}
+    
+    def detect_trendlines(
+        self, df: pd.DataFrame, target_column: str = "returns", window: int = 5
+    ) -> Dict[str, PatternMetric]:
+        """Detect trendlines using regression on extrema"""
+        if df.empty or 'close' not in df.columns:
+            return {}
+        
+        patterns = {}
+        try:
+            close = df['close'].values
+            high_indices = np.where(self._find_extrema(close, window=window, extrema_type='max') == 1)[0]
+            low_indices = np.where(self._find_extrema(close, window=window, extrema_type='min') == 1)[0]
+            
+            uptrend = np.zeros(len(df), dtype=int)
+            downtrend = np.zeros(len(df), dtype=int)
+            
+            if len(high_indices) >= 2:
+                z = np.polyfit(high_indices[-2:], close[high_indices[-2:]], 1)
+                for i in range(high_indices[-1]+1, len(df)):
+                    if close[i] > np.polyval(z, i):
+                        uptrend[i] = 1
+            
+            if len(low_indices) >= 2:
+                z = np.polyfit(low_indices[-2:], close[low_indices[-2:]], 1)
+                for i in range(low_indices[-1]+1, len(df)):
+                    if close[i] < np.polyval(z, i):
+                        downtrend[i] = 1
+            
+            for name, signal in [('uptrend', uptrend), ('downtrend', downtrend)]:
+                metrics = self._calculate_pattern_metrics(pd.Series(signal), df[target_column])
+                patterns[name] = PatternMetric(
+                    name=f"trendline_{name}",
+                    pattern_type=PatternType.TREND_LINE,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+            
+            return {k: v for k, v in patterns.items() if v.occurrence_count > 0}
+        
+        except Exception as e:
+            logger.error(f"Error detecting trendlines: {e}")
             return {}
     
     def _detect_engulfing_patterns(
