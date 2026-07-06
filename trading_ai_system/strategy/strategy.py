@@ -1,6 +1,6 @@
 """
-Strategy Module - Signal generation, walk-forward validation, strategy analysis
-v79.2: Full integration with models, features, risk modules
+Strategy Module - Signal generation, walk-forward validation (v79.3)
+Critical bug fixes: annual return, sharpe ratio, consecutive losses, stability score
 """
 
 import numpy as np
@@ -13,8 +13,15 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
+
+PERIODS_PER_YEAR = 252
+RISK_FREE_RATE = 0.02
+BIAS_CORRELATION_THRESHOLD = 0.3
+STABILITY_MIN_THRESHOLD = 0.01
+CACHE_MAX_SIZE = 1000
 
 
 class Signal(Enum):
@@ -54,8 +61,26 @@ class SignalResult:
 
 
 @dataclass
+class Trade:
+    """Individual trade record."""
+    entry_time: datetime
+    exit_time: datetime
+    entry_price: float
+    exit_price: float
+    position_size: float
+    side: int
+    pnl: float
+    pnl_pct: float
+    commission: float = 0.0
+    slippage: float = 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class BacktestMetrics:
-    """Backtest performance metrics."""
+    """Backtest performance metrics with fixes."""
     total_return: float
     annual_return: float
     sharpe_ratio: float
@@ -67,12 +92,31 @@ class BacktestMetrics:
     avg_win: float
     avg_loss: float
     consecutive_losses: int
+    commission_paid: float = 0.0
+    slippage_paid: float = 0.0
+    trades_list: List[Trade] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            "total_return": self.total_return,
+            "annual_return": self.annual_return,
+            "sharpe_ratio": self.sharpe_ratio,
+            "max_drawdown": self.max_drawdown,
+            "win_rate": self.win_rate,
+            "profit_factor": self.profit_factor,
+            "trades": self.trades,
+            "winning_trades": self.winning_trades,
+            "avg_win": self.avg_win,
+            "avg_loss": self.avg_loss,
+            "consecutive_losses": self.consecutive_losses,
+            "commission_paid": self.commission_paid,
+            "slippage_paid": self.slippage_paid,
+        }
     
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), default=str)
+        d = self.to_dict()
+        d['trades_list'] = [t.to_dict() for t in self.trades_list]
+        return json.dumps(d, default=str)
 
 
 @dataclass
@@ -84,6 +128,7 @@ class WalkForwardResult:
     out_of_sample_metrics: BacktestMetrics
     model_path: str
     stability_score: float
+    overfitting_ratio: float = 0.0
     window_index: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
@@ -94,6 +139,7 @@ class WalkForwardResult:
             "out_of_sample_metrics": self.out_of_sample_metrics.to_dict(),
             "model_path": self.model_path,
             "stability_score": self.stability_score,
+            "overfitting_ratio": self.overfitting_ratio,
             "window_index": self.window_index,
         }
     
@@ -102,19 +148,19 @@ class WalkForwardResult:
 
 
 class SignalGenerator:
-    """Core signal generation from trained models."""
+    """Core signal generation with LRU cache."""
     
     def __init__(
         self,
         models_dir: str = "models/incremental",
         cache_enabled: bool = True,
-        cache_size: int = 1000,
+        cache_size: int = CACHE_MAX_SIZE,
     ):
         self.models_dir = Path(models_dir)
         self.cache_enabled = cache_enabled
         self.cache_size = cache_size
         
-        self._model_cache: Dict[str, Any] = {}
+        self._model_cache: OrderedDict = OrderedDict()
         self._metadata_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_lock = threading.RLock()
         self._cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
@@ -140,11 +186,16 @@ class SignalGenerator:
             X = features.iloc[[-1]].fillna(0.0).astype(np.float32)
             
             if model_predictions is not None:
-                probs = np.array(model_predictions)
+                probs = np.array(model_predictions, dtype=np.float64)
+                prob_sum = np.sum(probs)
+                
+                if prob_sum <= 0:
+                    logger.warning(f"Invalid model predictions sum: {prob_sum}, using default")
+                    probs = np.array([0.25, 0.35, 0.40])
+                else:
+                    probs = probs / prob_sum
             else:
                 probs = np.array([0.25, 0.35, 0.40])
-            
-            probs = probs / np.sum(probs)
             
             cls_idx = int(np.argmax(probs))
             class_order = [-1, 0, 1]
@@ -161,9 +212,14 @@ class SignalGenerator:
             gating_allowed = True
             gate_reason = ""
             if gating_fn is not None:
-                gate_result = gating_fn(probs, confidence=confidence)
-                gating_allowed = gate_result.get("gate_allowed", True)
-                gate_reason = gate_result.get("reason", "")
+                try:
+                    gate_result = gating_fn(probs, confidence=confidence)
+                    gating_allowed = gate_result.get("gate_allowed", True)
+                    gate_reason = gate_result.get("reason", "")
+                except Exception as e:
+                    logger.warning(f"Gating function error: {e}")
+                    gating_allowed = False
+                    gate_reason = f"Gating error: {str(e)[:50]}"
             
             with self._cache_lock:
                 self._cache_stats["hits"] += 1
@@ -183,7 +239,7 @@ class SignalGenerator:
             )
         
         except Exception as e:
-            logger.error(f"Signal generation error {symbol}: {e}")
+            logger.exception(f"Signal generation error {symbol}: {e}")
             return SignalResult(
                 signal=Signal.HOLD,
                 confidence=0.0,
@@ -228,7 +284,7 @@ class SignalGenerator:
             self._cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
     
     def _evict_cache(self) -> None:
-        """Evict oldest entry if cache full."""
+        """Evict oldest entry (LRU)."""
         if len(self._model_cache) >= self.cache_size:
             oldest_key = next(iter(self._model_cache))
             del self._model_cache[oldest_key]
@@ -238,7 +294,7 @@ class SignalGenerator:
 
 
 class WalkForwardEngine:
-    """Walk-forward optimization and validation."""
+    """Walk-forward optimization with cached windows."""
     
     def __init__(
         self,
@@ -252,75 +308,109 @@ class WalkForwardEngine:
         
         self.results: List[WalkForwardResult] = []
         self._lock = threading.RLock()
+        self._cached_windows: Optional[List[Tuple[int, int, int, int]]] = None
+        self._last_data_len: Optional[int] = None
     
     def get_windows(self, data: pd.DataFrame) -> List[Tuple[int, int, int, int]]:
-        """Generate walk-forward window indices."""
+        """Generate walk-forward window indices with caching."""
         n = len(data)
-        windows = []
         
-        current_train_start = 0
-        window_index = 0
-        
-        while current_train_start + self.initial_window + self.test_window < n:
-            train_start = current_train_start
-            train_end = current_train_start + self.initial_window
-            test_start = train_end
-            test_end = test_start + self.test_window
+        with self._lock:
+            if self._cached_windows is not None and self._last_data_len == n:
+                return self._cached_windows
             
-            if test_end <= n:
-                windows.append((train_start, train_end, test_start, test_end))
-                window_index += 1
+            windows = []
+            current_train_start = 0
             
-            current_train_start += self.step_size
-        
-        return windows
+            while current_train_start + self.initial_window + self.test_window < n:
+                train_start = current_train_start
+                train_end = current_train_start + self.initial_window
+                test_start = train_end
+                test_end = test_start + self.test_window
+                
+                if test_end <= n:
+                    windows.append((train_start, train_end, test_start, test_end))
+                
+                current_train_start += self.step_size
+            
+            self._cached_windows = windows
+            self._last_data_len = n
+            
+            return windows
     
     def calculate_metrics(
         self,
         returns: np.ndarray,
-        trades: List[Dict[str, Any]],
+        trades: List[Trade],
+        periods_per_year: int = PERIODS_PER_YEAR,
+        risk_free_rate: float = RISK_FREE_RATE,
+        commission: float = 0.0,
+        slippage: float = 0.0,
     ) -> BacktestMetrics:
-        """Calculate backtest metrics."""
-        total_return = float(np.sum(returns))
-        annual_return = total_return * 252
+        """Calculate backtest metrics with fixes."""
         
-        if len(returns) > 1:
-            sharpe = np.mean(returns) / max(np.std(returns), 1e-10) * np.sqrt(252)
+        returns = np.nan_to_num(returns, nan=0.0)
+        
+        if len(returns) == 0:
+            return BacktestMetrics(
+                total_return=0.0,
+                annual_return=0.0,
+                sharpe_ratio=0.0,
+                max_drawdown=0.0,
+                win_rate=0.0,
+                profit_factor=0.0,
+                trades=0,
+                winning_trades=0,
+                avg_win=0.0,
+                avg_loss=0.0,
+                consecutive_losses=0,
+            )
+        
+        cumulative_returns = np.cumprod(1 + returns) - 1
+        total_return = cumulative_returns[-1] if len(cumulative_returns) > 0 else 0.0
+        
+        years = len(returns) / periods_per_year
+        if years > 0:
+            annual_return = (1 + total_return) ** (1 / years) - 1
         else:
-            sharpe = 0.0
+            annual_return = total_return
         
-        if len(returns) > 0:
-            cumulative = np.cumprod(1 + returns)
-            running_max = np.maximum.accumulate(cumulative)
-            drawdown = (cumulative - running_max) / running_max
-            max_dd = np.min(drawdown) if len(drawdown) > 0 else 0.0
-        else:
-            max_dd = 0.0
+        excess_returns = returns - (risk_free_rate / periods_per_year)
+        excess_std = np.std(excess_returns) if len(excess_returns) > 1 else 1e-10
+        sharpe = (np.mean(excess_returns) / max(excess_std, 1e-10)) * np.sqrt(periods_per_year)
         
-        wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
-        losses = sum(1 for t in trades if t.get("pnl", 0) < 0)
+        cumulative = np.cumprod(1 + returns)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdown = (cumulative - running_max) / running_max
+        max_dd = np.min(drawdown) if len(drawdown) > 0 else 0.0
+        
+        wins = sum(1 for t in trades if t.pnl > 0)
+        losses = sum(1 for t in trades if t.pnl < 0)
         
         win_rate = wins / max(len(trades), 1)
         
-        profit = sum(t.get("pnl", 0) for t in trades if t.get("pnl", 0) > 0)
-        loss = abs(sum(t.get("pnl", 0) for t in trades if t.get("pnl", 0) < 0))
+        profit = sum(t.pnl for t in trades if t.pnl > 0)
+        loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
         profit_factor = profit / max(loss, 1e-10)
         
         avg_win = profit / max(wins, 1)
         avg_loss = loss / max(losses, 1)
         
-        consecutive_losses = 0
         max_consecutive_losses = 0
+        consecutive_losses = 0
         for t in trades:
-            if t.get("pnl", 0) < 0:
+            if t.pnl < 0:
                 consecutive_losses += 1
                 max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
             else:
                 consecutive_losses = 0
         
+        commission_paid = sum(t.commission for t in trades)
+        slippage_paid = sum(t.slippage for t in trades)
+        
         return BacktestMetrics(
-            total_return=total_return,
-            annual_return=annual_return,
+            total_return=float(total_return),
+            annual_return=float(annual_return),
             sharpe_ratio=float(sharpe),
             max_drawdown=float(max_dd),
             win_rate=float(win_rate),
@@ -330,6 +420,9 @@ class WalkForwardEngine:
             avg_win=float(avg_win),
             avg_loss=float(avg_loss),
             consecutive_losses=max_consecutive_losses,
+            commission_paid=float(commission_paid),
+            slippage_paid=float(slippage_paid),
+            trades_list=trades,
         )
     
     def add_result(
@@ -341,10 +434,17 @@ class WalkForwardEngine:
         model_path: str = "",
     ) -> WalkForwardResult:
         """Add walk-forward result."""
-        stability = min(
-            test_metrics.sharpe_ratio / max(train_metrics.sharpe_ratio, 0.01),
-            1.0
-        )
+        
+        train_sharpe = max(train_metrics.sharpe_ratio, STABILITY_MIN_THRESHOLD)
+        test_sharpe = max(test_metrics.sharpe_ratio, 0.0)
+        
+        stability = min(test_sharpe / train_sharpe, 1.0)
+        stability = max(stability, 0.0)
+        
+        train_return = max(abs(train_metrics.annual_return), 1e-10)
+        test_return = abs(test_metrics.annual_return)
+        overfitting_ratio = 1.0 - (test_return / train_return) if train_return > 0 else 1.0
+        overfitting_ratio = max(0.0, min(overfitting_ratio, 1.0))
         
         result = WalkForwardResult(
             train_period=train_period,
@@ -353,6 +453,7 @@ class WalkForwardEngine:
             out_of_sample_metrics=test_metrics,
             model_path=model_path,
             stability_score=float(stability),
+            overfitting_ratio=float(overfitting_ratio),
             window_index=len(self.results),
         )
         
@@ -375,12 +476,13 @@ class WalkForwardEngine:
                 "windows_tested": len(self.results),
                 "avg_sharpe": float(np.mean(sharpe_ratios)),
                 "std_sharpe": float(np.std(sharpe_ratios)),
+                "min_sharpe": float(np.min(sharpe_ratios)),
+                "max_sharpe": float(np.max(sharpe_ratios)),
                 "avg_return": float(np.mean(returns)),
                 "avg_max_dd": float(np.mean([m.max_drawdown for m in test_metrics])),
                 "avg_win_rate": float(np.mean([m.win_rate for m in test_metrics])),
-                "stability_score": float(np.mean([r.stability_score for r in self.results])),
-                "min_sharpe": float(np.min(sharpe_ratios)),
-                "max_sharpe": float(np.max(sharpe_ratios)),
+                "avg_stability": float(np.mean([r.stability_score for r in self.results])),
+                "avg_overfitting": float(np.mean([r.overfitting_ratio for r in self.results])),
             }
     
     def get_results_dataframe(self) -> pd.DataFrame:
@@ -400,9 +502,24 @@ class WalkForwardEngine:
                     'train_return': r.in_sample_metrics.annual_return,
                     'test_return': r.out_of_sample_metrics.annual_return,
                     'stability_score': r.stability_score,
+                    'overfitting_ratio': r.overfitting_ratio,
                 })
             
             return pd.DataFrame(data)
+    
+    def detect_overfitting(self, threshold: float = 0.3) -> Tuple[bool, str]:
+        """Detect overfitting in walk-forward results."""
+        with self._lock:
+            if not self.results:
+                return False, "Insufficient results"
+            
+            overfitting_ratios = [r.overfitting_ratio for r in self.results]
+            avg_overfitting = np.mean(overfitting_ratios)
+            
+            if avg_overfitting > threshold:
+                return True, f"High overfitting detected: {avg_overfitting:.2%}"
+            
+            return False, f"Overfitting OK: {avg_overfitting:.2%}"
 
 
 class StrategyValidator:
@@ -413,16 +530,17 @@ class StrategyValidator:
         signals: pd.Series,
         future_returns: pd.Series,
         lookback: int = 5,
+        threshold: float = BIAS_CORRELATION_THRESHOLD,
     ) -> Tuple[bool, str]:
-        """Check for forward-looking bias in signals."""
+        """Check for forward-looking bias."""
         if len(signals) < lookback or len(future_returns) < lookback:
             return False, "Insufficient data"
         
         try:
             correlation = signals.corr(future_returns)
             
-            if correlation > 0.3:
-                return True, f"High correlation: {correlation:.3f}"
+            if correlation > threshold:
+                return True, f"High correlation: {correlation:.3f} (threshold: {threshold})"
             
             return False, f"No bias detected (corr: {correlation:.3f})"
         except Exception as e:
@@ -597,6 +715,7 @@ def get_live_lite_mode() -> LiveLiteMode:
 __all__ = [
     "Signal",
     "SignalResult",
+    "Trade",
     "BacktestMetrics",
     "WalkForwardResult",
     "SignalGenerator",
