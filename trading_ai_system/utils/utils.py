@@ -15,6 +15,9 @@ import pickle
 import hashlib
 import logging
 import os
+import sys
+import time
+import inspect
 from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,15 +53,22 @@ def safe_save(obj: Any, file_handle) -> None:
     """
     try:
         # Type validation - prevent dangerous objects
-        forbidden_types = (type, __builtins__, type(os))
-        if isinstance(obj, forbidden_types):
+        if inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isclass(obj):
+            raise TypeError(f"Cannot serialize {type(obj).__name__} (code objects)")
+        
+        if isinstance(obj, (type, type(os), type(os.path))):
             raise TypeError(f"Cannot serialize {type(obj).__name__}")
         
         pickle.dump(obj, file_handle, protocol=pickle.HIGHEST_PROTOCOL)
         logger.debug(f"Object serialized: {type(obj).__name__}")
+    except pickle.PicklingError as e:
+        logger.error(f"Pickling error: {e}")
+        raise TypeError(f"Cannot pickle {type(obj).__name__}") from e
+    except TypeError:
+        raise
     except Exception as e:
         logger.error(f"Serialization failed: {e}")
-        raise
+        raise TypeError(f"Serialization failed: {e}") from e
 
 
 def safe_load(file_handle, allowed_types: Optional[set] = None) -> Any:
@@ -83,24 +93,26 @@ def safe_load(file_handle, allowed_types: Optional[set] = None) -> Any:
         """Restrict pickle to safe types only."""
         
         def find_class(self, module: str, name: str):
-            # Whitelist safe ML/data classes
-            allowed = {
-                ('lightgbm.basic', 'Booster'),
-                ('lightgbm.sklearn', 'LGBMClassifier'),
-                ('sklearn.linear_model._logistic', 'LogisticRegression'),
-                ('sklearn.preprocessing._encoders', 'LabelEncoder'),
-                ('xgboost.sklearn', 'XGBClassifier'),
-                ('catboost.core', 'CatBoostClassifier'),
-                ('pandas.core.frame', 'DataFrame'),
-                ('numpy', 'ndarray'),
-                ('builtins', 'dict'),
-                ('builtins', 'list'),
+            # Safe module prefixes
+            safe_modules = {
+                'pandas', 'numpy', 'lightgbm', 'sklearn', 'xgboost', 
+                'catboost', 'builtins', 'datetime', 'collections',
             }
             
-            if allowed_types:
-                allowed = allowed | allowed_types
+            # Special handling for __main__ - only if in custom allowed_types
+            if module == '__main__' and allowed_types:
+                if (module, name) in allowed_types:
+                    return super().find_class(module, name)
+                raise pickle.UnpicklingError(f"Unsafe class {module}.{name}")
             
-            if (module, name) not in allowed:
+            # Check if module is in safe list or starts with safe prefix
+            is_safe = any(module == m or module.startswith(m + '.') for m in safe_modules)
+            
+            # Check against custom allowed_types if provided
+            if allowed_types and (module, name) in allowed_types:
+                is_safe = True
+            
+            if not is_safe:
                 raise pickle.UnpicklingError(f"Unsafe class {module}.{name}")
             
             return super().find_class(module, name)
@@ -216,7 +228,7 @@ def to_utc_naive(df_or_ts: Any, timestamp_col: str = "timestamp") -> Any:
         t = t.tz_convert("UTC").tz_localize(None)
     else:
         t = t.tz_localize(None)
-    return t.normalize()
+    return t
 
 
 def compare_timestamps(ts1: Any, ts2: Any) -> int:
@@ -266,19 +278,19 @@ def convert_timezone_aware_to_naive(df: pd.DataFrame, timestamp_col: str = "time
     
     ts_col = df[timestamp_col]
     
+    # Convert to datetime if needed
+    if ts_col.dtype == 'object' or not pd.api.types.is_datetime64_any_dtype(ts_col):
+        ts_col = pd.to_datetime(ts_col, utc=True, errors='coerce')
+    
     # Handle timezone-aware datetimes
     if hasattr(ts_col.dtype, 'tz') and ts_col.dtype.tz is not None:
         df[timestamp_col] = ts_col.dt.tz_convert('UTC').dt.tz_localize(None)
+    elif hasattr(ts_col, 'dt'):
+        # Already datetime-like, just ensure naive
+        df[timestamp_col] = ts_col.dt.tz_localize(None)
     else:
-        # For mixed or non-standard formats, use apply
-        def _convert_single(ts):
-            if pd.isna(ts):
-                return ts
-            if hasattr(ts, 'tz') and ts.tz is not None:
-                return ts.tz_convert('UTC').tz_localize(None)
-            return ts
-        
-        df[timestamp_col] = ts_col.apply(_convert_single)
+        # Fallback: force datetime conversion
+        df[timestamp_col] = pd.to_datetime(ts_col, utc=True, errors='coerce').dt.tz_localize(None)
     
     return df
 
@@ -287,13 +299,14 @@ def convert_timezone_aware_to_naive(df: pd.DataFrame, timestamp_col: str = "time
 # DATA VALIDATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def validate_raw_data(df: pd.DataFrame) -> Dict[str, Any]:
+def validate_raw_data(df: pd.DataFrame, timestamp_col: str = "timestamp") -> Dict[str, Any]:
     """Validate raw OHLCV data quality.
     
     v79 FIX: Comprehensive data validation
     
     Args:
         df: Raw OHLCV dataframe
+        timestamp_col: Name of timestamp column
     
     Returns:
         Dict with validation results
@@ -307,9 +320,15 @@ def validate_raw_data(df: pd.DataFrame) -> Dict[str, Any]:
     if missing:
         issues.append(f"Missing columns: {missing}")
     
-    # Check for duplicates
-    if df.index.duplicated().any():
-        warnings.append(f"Duplicate timestamps: {df.index.duplicated().sum()}")
+    # Check for duplicates in timestamp column or index
+    if timestamp_col in df.columns:
+        dup_count = df[timestamp_col].duplicated().sum()
+        if dup_count > 0:
+            warnings.append(f"Duplicate timestamps: {dup_count}")
+    elif isinstance(df.index, pd.DatetimeIndex):
+        dup_count = df.index.duplicated().sum()
+        if dup_count > 0:
+            warnings.append(f"Duplicate timestamps: {dup_count}")
     
     # Check data types
     for col in ["open", "high", "low", "close", "volume"]:
@@ -373,18 +392,21 @@ def validate_data_schema(df: pd.DataFrame, schema: Dict[str, str]) -> Tuple[bool
 # ═══════════════════════════════════════════════════════════════════════════
 
 class CacheManager:
-    """v79: Centralized cache management for memory and disk."""
+    """v79: Centralized cache management for memory and disk with TTL/size limits."""
     
-    def __init__(self, cache_dir: str = "./cache", max_size_mb: int = 1000):
+    def __init__(self, cache_dir: str = "./cache", max_size_mb: int = 1000, ttl_seconds: int = 3600):
         """Initialize cache manager.
         
         Args:
             cache_dir: Directory for cache files
             max_size_mb: Maximum cache size in MB
+            ttl_seconds: Time-to-live for cache entries (seconds)
         """
         self.cache_dir = Path(cache_dir)
         self.max_size_mb = max_size_mb
+        self.ttl_seconds = ttl_seconds
         self._memory_cache: Dict[str, Any] = {}
+        self._timestamps: Dict[str, float] = {}
         self._lock = threading.RLock()
         
         # Create cache directory
@@ -401,9 +423,15 @@ class CacheManager:
             Cached value or None
         """
         with self._lock:
-            # Check memory cache first
+            # Check TTL for memory cache
             if key in self._memory_cache:
-                return self._memory_cache[key]
+                ts = self._timestamps.get(key, time.time())
+                if time.time() - ts < self.ttl_seconds:
+                    return self._memory_cache[key]
+                else:
+                    # TTL expired
+                    del self._memory_cache[key]
+                    self._timestamps.pop(key, None)
             
             # Check disk cache
             if from_disk:
@@ -411,8 +439,10 @@ class CacheManager:
                 if cache_file.exists():
                     try:
                         with open(cache_file, "rb") as f:
-                            obj = pickle.load(f)
+                            obj = safe_load(f)
                             self._memory_cache[key] = obj
+                            self._timestamps[key] = time.time()
+                            self._evict_if_needed()
                             return obj
                     except Exception as e:
                         logger.warning(f"Failed to load {key} from disk: {e}")
@@ -428,15 +458,19 @@ class CacheManager:
             to_disk: Also save to disk
         """
         with self._lock:
-            # Store in memory cache
+            # Store in memory cache with timestamp
             self._memory_cache[key] = value
+            self._timestamps[key] = time.time()
+            
+            # Check and evict if necessary
+            self._evict_if_needed()
             
             # Store to disk if requested
             if to_disk:
                 cache_file = self.cache_dir / f"{key}.pkl"
                 try:
                     with open(cache_file, "wb") as f:
-                        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        safe_save(value, f)
                 except Exception as e:
                     logger.warning(f"Failed to save {key} to disk: {e}")
     
@@ -467,13 +501,29 @@ class CacheManager:
             except Exception as e:
                 logger.warning(f"Failed to clear disk cache: {e}")
     
+    def _evict_if_needed(self) -> None:
+        """Evict oldest entries if cache size exceeds limit."""
+        memory_size = sum(sys.getsizeof(v) for v in self._memory_cache.values())
+        max_bytes = self.max_size_mb * 1024 * 1024
+        
+        if memory_size > max_bytes:
+            # Evict oldest entries by timestamp
+            sorted_keys = sorted(self._timestamps.items(), key=lambda x: x[1])
+            for key, _ in sorted_keys:
+                if key in self._memory_cache:
+                    del self._memory_cache[key]
+                    self._timestamps.pop(key, None)
+                    memory_size = sum(sys.getsizeof(v) for v in self._memory_cache.values())
+                    if memory_size <= max_bytes * 0.9:  # Keep at 90% of max
+                        break
+    
     def get_size(self) -> Dict[str, int]:
         """Get cache size statistics.
         
         Returns:
             Dict with memory and disk sizes
         """
-        memory_size = sum(len(str(v)) for v in self._memory_cache.values())
+        memory_size = sum(sys.getsizeof(v) for v in self._memory_cache.values())
         
         disk_size = 0
         if self.cache_dir.exists():
@@ -504,45 +554,165 @@ def optimize_dataframe_dtypes(df: pd.DataFrame, exclude_cols: Optional[List[str]
     Returns:
         DataFrame with optimized dtypes
     """
+    # Constants for dtype optimization thresholds (1e9 supports crypto prices up to $1B)
+    FLOAT_RANGE_LIMIT = 1e9
+    INT32_MAX = 2**31 - 1
+    INT32_MIN = -(2**31)
+    MIN_SAVINGS_PCT = 1.0
+    
     if exclude_cols is None:
         exclude_cols = []
     
     exclude_set = set(exclude_cols) | {"timestamp", "datetime", "date"}
     original_mem = df.memory_usage(deep=True).sum() / 1024 / 1024
     
-    for col in df.columns:
-        if col in exclude_set:
+    # Use select_dtypes for efficiency - handle float64 and float32
+    float_cols = df.select_dtypes(include=[np.float64, np.float32]).columns
+    int_cols = df.select_dtypes(include=[np.int64, np.int32]).columns
+    
+    for col in float_cols:
+        if col in exclude_set or df[col].dtype == np.float32:
             continue
         
-        dtype = df[col].dtype
+        col_min = df[col].min()
+        col_max = df[col].max()
         
-        # Convert float64 → float32 for most features
-        if dtype == np.float64:
-            col_min = df[col].min()
-            col_max = df[col].max()
-            
-            # Keep float64 for very small or very large numbers
-            if not (pd.isna(col_min) or pd.isna(col_max)):
-                if (col_min >= -1e6 and col_max <= 1e6):  # Normal range
-                    df[col] = df[col].astype(np.float32)
+        if not (pd.isna(col_min) or pd.isna(col_max)):
+            if col_min >= -FLOAT_RANGE_LIMIT and col_max <= FLOAT_RANGE_LIMIT:
+                df[col] = df[col].astype(np.float32)
+    
+    for col in int_cols:
+        if col in exclude_set or df[col].dtype == np.int32:
+            continue
         
-        # Convert int64 → int32 for small integers
-        elif dtype == np.int64:
-            col_max = df[col].max()
-            col_min = df[col].min()
-            if col_max < 2**31 - 1 and col_min > -(2**31):
-                df[col] = df[col].astype(np.int32)
+        col_max = df[col].max()
+        col_min = df[col].min()
+        if col_max < INT32_MAX and col_min > INT32_MIN:
+            df[col] = df[col].astype(np.int32)
     
     optimized_mem = df.memory_usage(deep=True).sum() / 1024 / 1024
     savings = (1 - optimized_mem / original_mem) * 100 if original_mem > 0 else 0
     
-    if savings > 1:
+    if savings > MIN_SAVINGS_PCT:
         logger.debug(
             f"optimize_dataframe_dtypes: {original_mem:.1f}MB → {optimized_mem:.1f}MB "
             f"({savings:.1f}% reduction)"
         )
     
     return df
+
+
+def resample_ohlcv(df: pd.DataFrame, freq: str, ohlc_dict: Optional[Dict[str, str]] = None, 
+                   timestamp_col: str = 'timestamp') -> pd.DataFrame:
+    """Resample OHLCV data to higher timeframe.
+    
+    Args:
+        df: OHLCV dataframe with timestamp index or column
+        freq: Target frequency (e.g., '1H', '1D', '4H')
+        ohlc_dict: Custom aggregation dict
+        timestamp_col: Timestamp column name (if not index)
+    
+    Returns:
+        Resampled OHLCV dataframe
+    """
+    if ohlc_dict is None:
+        ohlc_dict = {
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+        }
+    
+    df = df.copy()
+    
+    # Ensure datetime index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if timestamp_col in df.columns:
+            df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True, errors='coerce')
+            df = df.set_index(timestamp_col)
+        else:
+            raise ValueError(f"No DatetimeIndex or '{timestamp_col}' column found")
+    
+    # Filter to only existing columns
+    valid_agg = {col: agg for col, agg in ohlc_dict.items() if col in df.columns}
+    
+    if not valid_agg:
+        raise ValueError("No valid OHLC columns found")
+    
+    resampled = df.resample(freq).agg(valid_agg)
+    resampled = resampled.dropna(how='all')
+    return resampled
+
+
+def merge_time_series(dfs: List[pd.DataFrame], on: str = 'timestamp', how: str = 'outer') -> pd.DataFrame:
+    """Merge multiple time series dataframes efficiently.
+    
+    Args:
+        dfs: List of dataframes to merge
+        on: Column name for merge (default 'timestamp')
+        how: Join type ('inner', 'outer', 'left', 'right')
+    
+    Returns:
+        Merged dataframe
+    """
+    if not dfs:
+        return pd.DataFrame()
+    
+    if len(dfs) == 1:
+        return dfs[0].copy()
+    
+    # Use concat with index alignment for better performance
+    if on in dfs[0].columns:
+        result = pd.concat(
+            [df.set_index(on) for df in dfs],
+            axis=1,
+            join=how
+        ).reset_index()
+    else:
+        # Fallback to merge
+        from functools import reduce
+        result = reduce(lambda l, r: pd.merge(l, r, on=on, how=how), dfs)
+    
+    return result.drop_duplicates(subset=[on], keep='first')
+
+
+def validate_time_series_completeness(df: pd.DataFrame, expected_freq: str, timestamp_col: str = 'timestamp') -> Dict[str, Any]:
+    """Detect time gaps and validate completeness of time series data.
+    
+    Args:
+        df: Time series dataframe
+        expected_freq: Expected frequency (e.g., '1H', '1D', '5min')
+        timestamp_col: Timestamp column name
+    
+    Returns:
+        Dict with gap analysis and statistics
+    """
+    if timestamp_col not in df.columns:
+        raise ValueError(f"Column '{timestamp_col}' not found")
+    
+    ts = pd.to_datetime(df[timestamp_col]).sort_values()
+    
+    # Expected frequency in nanoseconds
+    freq_offset = pd.tseries.frequencies.to_offset(expected_freq)
+    expected_delta = pd.Timedelta(freq_offset)
+    
+    # Calculate actual deltas
+    deltas = ts.diff()
+    gaps = deltas[deltas > expected_delta]
+    
+    total_expected = len(pd.date_range(start=ts.min(), end=ts.max(), freq=expected_freq))
+    coverage = (len(ts) / total_expected * 100) if total_expected > 0 else 0
+    
+    return {
+        'total_rows': len(df),
+        'expected_rows': total_expected,
+        'coverage_pct': coverage,
+        'gap_count': len(gaps),
+        'gap_rows': int(total_expected - len(ts)),
+        'time_range': f"{ts.min()} to {ts.max()}",
+        'gaps': gaps.to_dict() if len(gaps) > 0 else {},
+    }
 
 
 def to_float32_array(arr: Union[np.ndarray, pd.Series, List], 
