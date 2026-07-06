@@ -1,13 +1,17 @@
-from trading_ai_system.discovery.indicator_discovery import (
-    IndicatorDiscovery,
+from trading_ai_system.discovery.discovery import (
+    Discovery,
     IndicatorMetric,
+    PatternMetric,
     IndicatorCombination,
     IndicatorCategory,
+    PatternType,
 )
 
 __all__ = [
-    'IndicatorDiscovery',
+    'Discovery',
     'IndicatorMetric',
+    'PatternMetric',
     'IndicatorCombination',
     'IndicatorCategory',
+    'PatternType',
 ]

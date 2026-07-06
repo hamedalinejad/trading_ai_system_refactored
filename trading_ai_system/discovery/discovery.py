@@ -1,6 +1,12 @@
 """
-Trading AI System - Indicator Discovery Module
-Automated discovery and ranking of optimal technical indicators and their combinations.
+Trading AI System - Discovery Module
+Automated discovery and ranking of technical indicators, price patterns, and features.
+
+Supports:
+- Indicator performance analysis and ranking
+- Technical pattern discovery
+- Feature combination optimization
+- Synergy detection between indicators
 """
 
 import logging
@@ -25,6 +31,15 @@ class IndicatorCategory(Enum):
     VOLUME = "volume"
     PRICE_ACTION = "price_action"
     RETURNS = "returns"
+
+
+class PatternType(Enum):
+    CANDLESTICK = "candlestick"
+    PRICE_ACTION = "price_action"
+    SUPPORT_RESISTANCE = "support_resistance"
+    TREND_LINE = "trend_line"
+    DIVERGENCE = "divergence"
+    BREAKOUT = "breakout"
 
 
 @dataclass
@@ -86,6 +101,49 @@ class IndicatorMetric:
 
 
 @dataclass
+class PatternMetric:
+    name: str
+    pattern_type: PatternType
+    occurrence_count: int = 0
+    success_rate: float = 0.0
+    avg_profit: float = 0.0
+    avg_loss: float = 0.0
+    profit_factor: float = 0.0
+    reliability: float = 0.0
+    lookback_periods: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    discovered_at: Optional[datetime] = None
+    
+    def score(self) -> float:
+        """Calculate pattern score"""
+        if self.occurrence_count < 5:
+            return 0.0
+        
+        score = (
+            self.success_rate * 0.4 +
+            min(self.profit_factor / 2.0, 1.0) * 0.4 +
+            self.reliability * 0.2
+        )
+        return max(0.0, min(score, 1.0))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "pattern_type": self.pattern_type.value,
+            "occurrence_count": self.occurrence_count,
+            "success_rate": self.success_rate,
+            "avg_profit": self.avg_profit,
+            "avg_loss": self.avg_loss,
+            "profit_factor": self.profit_factor,
+            "reliability": self.reliability,
+            "lookback_periods": self.lookback_periods,
+            "score": self.score(),
+            "metadata": self.metadata,
+            "discovered_at": self.discovered_at.isoformat() if self.discovered_at else None
+        }
+
+
+@dataclass
 class IndicatorCombination:
     indicators: List[str]
     combined_score: float = 0.0
@@ -124,16 +182,19 @@ class IndicatorCombination:
         }
 
 
-class IndicatorDiscovery:
-    """Automated indicator discovery and ranking system"""
+class Discovery:
+    """Automated discovery system for indicators, patterns, and features"""
     
     def __init__(self, min_samples: int = 100, confidence_threshold: float = 0.55):
         self.min_samples = min_samples
         self.confidence_threshold = confidence_threshold
         self.indicators: Dict[str, IndicatorMetric] = {}
+        self.patterns: Dict[str, PatternMetric] = {}
         self.combinations: Dict[str, IndicatorCombination] = {}
         self._lock = Lock()
         self.discovery_history: List[Dict[str, Any]] = []
+    
+    # ==================== INDICATOR DISCOVERY ====================
     
     def analyze_indicator_performance(
         self,
@@ -212,6 +273,346 @@ class IndicatorDiscovery:
             logger.error(f"Error analyzing {indicator_name}: {e}")
             return None
     
+    def discover_indicators(
+        self,
+        df: pd.DataFrame,
+        target_column: str = "returns",
+        min_score: float = 0.5
+    ) -> Dict[str, IndicatorMetric]:
+        """Discover and rank all available indicators"""
+        
+        if df.empty:
+            logger.warning("Empty DataFrame provided")
+            return {}
+        
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        if target_column in numeric_cols:
+            numeric_cols.remove(target_column)
+        
+        discovered = {}
+        
+        for col in numeric_cols:
+            inferred_category = self._infer_category(col)
+            metric = self.analyze_indicator_performance(df, col, inferred_category, target_column)
+            
+            if metric and metric.composite_score() >= min_score:
+                discovered[col] = metric
+        
+        logger.info(f"Discovered {len(discovered)} indicators with score >= {min_score}")
+        return discovered
+    
+    # ==================== PATTERN DISCOVERY ====================
+    
+    def detect_candlestick_patterns(
+        self,
+        df: pd.DataFrame,
+        target_column: str = "returns"
+    ) -> Dict[str, PatternMetric]:
+        """Detect and analyze candlestick patterns"""
+        
+        if df.empty or not all(c in df.columns for c in ['open', 'close', 'high', 'low']):
+            return {}
+        
+        patterns_found = {}
+        
+        try:
+            # Engulfing patterns
+            patterns_found.update(self._detect_engulfing_patterns(df, target_column))
+            
+            # Doji patterns
+            patterns_found.update(self._detect_doji_patterns(df, target_column))
+            
+            # Inside bar patterns
+            patterns_found.update(self._detect_inside_bar_patterns(df, target_column))
+            
+            # Three bar patterns
+            patterns_found.update(self._detect_three_bar_patterns(df, target_column))
+            
+            # Star patterns
+            patterns_found.update(self._detect_star_patterns(df, target_column))
+            
+            with self._lock:
+                self.patterns.update(patterns_found)
+            
+            logger.info(f"Discovered {len(patterns_found)} candlestick patterns")
+            return patterns_found
+        
+        except Exception as e:
+            logger.error(f"Error in candlestick pattern detection: {e}")
+            return {}
+    
+    def _detect_engulfing_patterns(
+        self,
+        df: pd.DataFrame,
+        target_column: str
+    ) -> Dict[str, PatternMetric]:
+        """Detect engulfing patterns"""
+        patterns = {}
+        
+        try:
+            df_work = df[['open', 'close', 'high', 'low', target_column]].astype(float)
+            
+            prev_open = df_work["open"].shift(1)
+            prev_close = df_work["close"].shift(1)
+            prev_body = (prev_close - prev_open).abs()
+            curr_body = (df_work["close"] - df_work["open"]).abs()
+            
+            # Bullish engulfing
+            bullish = (
+                (prev_close < prev_open) &
+                (df_work["close"] > df_work["open"]) &
+                (df_work["open"] <= prev_close) &
+                (df_work["close"] >= prev_open) &
+                (curr_body > prev_body)
+            )
+            
+            if bullish.sum() > 0:
+                metrics = self._calculate_pattern_metrics(bullish, df_work[target_column])
+                patterns['engulfing_bullish'] = PatternMetric(
+                    name='engulfing_bullish',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+            
+            # Bearish engulfing
+            bearish = (
+                (prev_close > prev_open) &
+                (df_work["close"] < df_work["open"]) &
+                (df_work["open"] >= prev_close) &
+                (df_work["close"] <= prev_open) &
+                (curr_body > prev_body)
+            )
+            
+            if bearish.sum() > 0:
+                metrics = self._calculate_pattern_metrics(bearish, df_work[target_column])
+                patterns['engulfing_bearish'] = PatternMetric(
+                    name='engulfing_bearish',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+        
+        except Exception as e:
+            logger.warning(f"Error in engulfing pattern detection: {e}")
+        
+        return patterns
+    
+    def _detect_doji_patterns(
+        self,
+        df: pd.DataFrame,
+        target_column: str,
+        threshold: float = 0.1
+    ) -> Dict[str, PatternMetric]:
+        """Detect doji patterns"""
+        patterns = {}
+        
+        try:
+            df_work = df[['open', 'close', 'high', 'low', target_column]].astype(float)
+            
+            body = (df_work["close"] - df_work["open"]).abs()
+            range_ = df_work["high"] - df_work["low"]
+            range_ = range_.replace(0, 1e-10)
+            
+            is_doji = ((body / (range_ + 1e-10)) < threshold)
+            
+            if is_doji.sum() > 0:
+                metrics = self._calculate_pattern_metrics(is_doji, df_work[target_column])
+                patterns['doji'] = PatternMetric(
+                    name='doji',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+        
+        except Exception as e:
+            logger.warning(f"Error in doji pattern detection: {e}")
+        
+        return patterns
+    
+    def _detect_inside_bar_patterns(
+        self,
+        df: pd.DataFrame,
+        target_column: str
+    ) -> Dict[str, PatternMetric]:
+        """Detect inside bar patterns"""
+        patterns = {}
+        
+        try:
+            df_work = df[['high', 'low', target_column]].astype(float)
+            
+            prev_high = df_work["high"].shift(1)
+            prev_low = df_work["low"].shift(1)
+            
+            inside_bar = (
+                (df_work["high"] <= prev_high) &
+                (df_work["low"] >= prev_low)
+            )
+            
+            if inside_bar.sum() > 0:
+                metrics = self._calculate_pattern_metrics(inside_bar, df_work[target_column])
+                patterns['inside_bar'] = PatternMetric(
+                    name='inside_bar',
+                    pattern_type=PatternType.PRICE_ACTION,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+        
+        except Exception as e:
+            logger.warning(f"Error in inside bar pattern detection: {e}")
+        
+        return patterns
+    
+    def _detect_three_bar_patterns(
+        self,
+        df: pd.DataFrame,
+        target_column: str
+    ) -> Dict[str, PatternMetric]:
+        """Detect three bar patterns"""
+        patterns = {}
+        
+        try:
+            df_work = df[['open', 'close', target_column]].astype(float)
+            
+            # Three white soldiers
+            bullish_1 = df_work["close"] > df_work["open"]
+            bullish_2 = df_work["close"].shift(1) > df_work["open"].shift(1)
+            bullish_3 = df_work["close"].shift(2) > df_work["open"].shift(2)
+            
+            higher_1 = df_work["close"] > df_work["close"].shift(1)
+            higher_2 = df_work["close"].shift(1) > df_work["close"].shift(2)
+            
+            three_white = bullish_1 & bullish_2 & bullish_3 & higher_1 & higher_2
+            
+            if three_white.sum() > 0:
+                metrics = self._calculate_pattern_metrics(three_white, df_work[target_column])
+                patterns['three_white_soldiers'] = PatternMetric(
+                    name='three_white_soldiers',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+            
+            # Three black crows
+            bearish_1 = df_work["close"] < df_work["open"]
+            bearish_2 = df_work["close"].shift(1) < df_work["open"].shift(1)
+            bearish_3 = df_work["close"].shift(2) < df_work["open"].shift(2)
+            
+            lower_1 = df_work["close"] < df_work["close"].shift(1)
+            lower_2 = df_work["close"].shift(1) < df_work["close"].shift(2)
+            
+            three_black = bearish_1 & bearish_2 & bearish_3 & lower_1 & lower_2
+            
+            if three_black.sum() > 0:
+                metrics = self._calculate_pattern_metrics(three_black, df_work[target_column])
+                patterns['three_black_crows'] = PatternMetric(
+                    name='three_black_crows',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+        
+        except Exception as e:
+            logger.warning(f"Error in three bar pattern detection: {e}")
+        
+        return patterns
+    
+    def _detect_star_patterns(
+        self,
+        df: pd.DataFrame,
+        target_column: str
+    ) -> Dict[str, PatternMetric]:
+        """Detect morning/evening star patterns"""
+        patterns = {}
+        
+        try:
+            df_work = df[['open', 'close', target_column]].astype(float)
+            
+            body_1 = (df_work["close"].shift(2) - df_work["open"].shift(2)).abs()
+            body_2 = (df_work["close"].shift(1) - df_work["open"].shift(1)).abs()
+            
+            # Morning star
+            morning = (
+                (df_work["close"].shift(2) < df_work["open"].shift(2)) &
+                (body_2 < body_1 * 0.3) &
+                (df_work["close"] > df_work["open"]) &
+                (df_work["close"] > (df_work["open"].shift(2) + df_work["close"].shift(2)) / 2)
+            )
+            
+            if morning.sum() > 0:
+                metrics = self._calculate_pattern_metrics(morning, df_work[target_column])
+                patterns['morning_star'] = PatternMetric(
+                    name='morning_star',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+            
+            # Evening star
+            evening = (
+                (df_work["close"].shift(2) > df_work["open"].shift(2)) &
+                (body_2 < body_1 * 0.3) &
+                (df_work["close"] < df_work["open"]) &
+                (df_work["close"] < (df_work["open"].shift(2) + df_work["close"].shift(2)) / 2)
+            )
+            
+            if evening.sum() > 0:
+                metrics = self._calculate_pattern_metrics(evening, df_work[target_column])
+                patterns['evening_star'] = PatternMetric(
+                    name='evening_star',
+                    pattern_type=PatternType.CANDLESTICK,
+                    **metrics,
+                    discovered_at=datetime.now(timezone.utc)
+                )
+        
+        except Exception as e:
+            logger.warning(f"Error in star pattern detection: {e}")
+        
+        return patterns
+    
+    def _calculate_pattern_metrics(
+        self,
+        pattern_signal: pd.Series,
+        returns: pd.Series
+    ) -> Dict[str, Any]:
+        """Calculate performance metrics for a pattern"""
+        pattern_returns = returns[pattern_signal].dropna()
+        
+        if len(pattern_returns) == 0:
+            return {
+                'occurrence_count': 0,
+                'success_rate': 0.0,
+                'avg_profit': 0.0,
+                'avg_loss': 0.0,
+                'profit_factor': 0.0,
+                'reliability': 0.0,
+                'lookback_periods': len(returns)
+            }
+        
+        occurrences = pattern_signal.sum()
+        wins = (pattern_returns > 0).sum()
+        losses = (pattern_returns < 0).sum()
+        
+        success_rate = wins / occurrences if occurrences > 0 else 0.0
+        avg_profit = pattern_returns[pattern_returns > 0].mean() if wins > 0 else 0.0
+        avg_loss = abs(pattern_returns[pattern_returns < 0].mean()) if losses > 0 else 0.0
+        
+        profit_factor = avg_profit / (avg_loss + 1e-10) if avg_loss > 0 else 1.0 if avg_profit > 0 else 0.0
+        reliability = min(1.0, occurrences / len(returns)) if len(returns) > 0 else 0.0
+        
+        return {
+            'occurrence_count': int(occurrences),
+            'success_rate': max(0.0, min(success_rate, 1.0)),
+            'avg_profit': float(avg_profit),
+            'avg_loss': float(avg_loss),
+            'profit_factor': max(0.0, profit_factor),
+            'reliability': max(0.0, min(reliability, 1.0)),
+            'lookback_periods': len(returns)
+        }
+    
+    # ==================== COMBINATION DISCOVERY ====================
+    
     def analyze_combination(
         self,
         df: pd.DataFrame,
@@ -287,35 +688,6 @@ class IndicatorDiscovery:
             logger.error(f"Error analyzing combination {indicator_names}: {e}")
             return None
     
-    def discover_indicators(
-        self,
-        df: pd.DataFrame,
-        target_column: str = "returns",
-        min_score: float = 0.5
-    ) -> Dict[str, IndicatorMetric]:
-        """Discover and rank all available indicators"""
-        
-        if df.empty:
-            logger.warning("Empty DataFrame provided")
-            return {}
-        
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        if target_column in numeric_cols:
-            numeric_cols.remove(target_column)
-        
-        discovered = {}
-        
-        for col in numeric_cols:
-            inferred_category = self._infer_category(col)
-            metric = self.analyze_indicator_performance(df, col, inferred_category, target_column)
-            
-            if metric and metric.composite_score() >= min_score:
-                discovered[col] = metric
-        
-        logger.info(f"Discovered {len(discovered)} indicators with score >= {min_score}")
-        return discovered
-    
     def discover_combinations(
         self,
         df: pd.DataFrame,
@@ -346,6 +718,8 @@ class IndicatorDiscovery:
         logger.info(f"Discovered {len(discovered_combos)} combinations with score >= {min_combo_score}")
         return discovered_combos
     
+    # ==================== RANKING & EXPORT ====================
+    
     def get_top_indicators(self, top_n: int = 10) -> List[Dict[str, Any]]:
         """Get top-ranked indicators"""
         sorted_indicators = sorted(
@@ -354,6 +728,15 @@ class IndicatorDiscovery:
             reverse=True
         )
         return [ind.to_dict() for ind in sorted_indicators[:top_n]]
+    
+    def get_top_patterns(self, top_n: int = 10) -> List[Dict[str, Any]]:
+        """Get top-ranked patterns"""
+        sorted_patterns = sorted(
+            self.patterns.values(),
+            key=lambda x: x.score(),
+            reverse=True
+        )
+        return [pat.to_dict() for pat in sorted_patterns[:top_n]]
     
     def get_top_combinations(self, top_n: int = 10) -> List[Dict[str, Any]]:
         """Get top-ranked indicator combinations"""
@@ -365,7 +748,7 @@ class IndicatorDiscovery:
         return [combo.to_dict() for combo in sorted_combos[:top_n]]
     
     def export_discoveries(self, output_path: Path) -> None:
-        """Export discovered indicators and combinations"""
+        """Export all discoveries to JSON file"""
         try:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -373,13 +756,17 @@ class IndicatorDiscovery:
             export_data = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "indicators": {name: metric.to_dict() for name, metric in self.indicators.items()},
+                "patterns": {name: pattern.to_dict() for name, pattern in self.patterns.items()},
                 "combinations": {name: combo.to_dict() for name, combo in self.combinations.items()},
                 "top_indicators": self.get_top_indicators(20),
+                "top_patterns": self.get_top_patterns(20),
                 "top_combinations": self.get_top_combinations(20),
                 "statistics": {
                     "total_indicators": len(self.indicators),
+                    "total_patterns": len(self.patterns),
                     "total_combinations": len(self.combinations),
                     "best_indicator_score": max([m.composite_score() for m in self.indicators.values()], default=0),
+                    "best_pattern_score": max([p.score() for p in self.patterns.values()], default=0),
                     "best_combination_score": max([c.effective_score() for c in self.combinations.values()], default=0)
                 }
             }
@@ -390,6 +777,8 @@ class IndicatorDiscovery:
             logger.info(f"Discoveries exported to {output_path}")
         except Exception as e:
             logger.error(f"Error exporting discoveries: {e}")
+    
+    # ==================== HELPER METHODS ====================
     
     def _calculate_win_rate(self, signal: np.ndarray, returns: np.ndarray) -> float:
         """Calculate win rate based on signal and returns"""
@@ -531,8 +920,10 @@ class IndicatorDiscovery:
 
 
 __all__ = [
-    'IndicatorDiscovery',
+    'Discovery',
     'IndicatorMetric',
+    'PatternMetric',
     'IndicatorCombination',
     'IndicatorCategory',
+    'PatternType',
 ]
