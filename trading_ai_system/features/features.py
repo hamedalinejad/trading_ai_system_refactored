@@ -51,6 +51,48 @@ class FeatureEngineeringError(Exception):
     pass
 
 
+def _get_scaler(scaler_type: str = 'standard'):
+    """Get scaler instance based on type"""
+    if scaler_type == 'robust':
+        from sklearn.preprocessing import RobustScaler
+        return RobustScaler()
+    elif scaler_type == 'minmax':
+        from sklearn.preprocessing import MinMaxScaler
+        return MinMaxScaler()
+    else:
+        from sklearn.preprocessing import StandardScaler
+        return StandardScaler()
+
+
+def _interpolate_missing_values(df: pd.DataFrame, timeframe: str = '1h', fill_method: str = 'interpolate') -> pd.DataFrame:
+    """Handle missing values with reindex and interpolation"""
+    if df.empty:
+        return df
+    
+    try:
+        if fill_method == 'interpolate':
+            freq_map = {
+                '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min',
+                '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w', '1M': '1MS'
+            }
+            freq = freq_map.get(timeframe, '1h')
+            
+            full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
+            df_reindexed = df.reindex(full_index)
+            
+            ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+            available_cols = [c for c in ohlcv_cols if c in df_reindexed.columns]
+            
+            for col in available_cols:
+                df_reindexed[col] = df_reindexed[col].interpolate(method='time', limit_direction='both')
+            
+            return df_reindexed
+    except Exception as e:
+        logger.warning(f"Interpolation failed: {e}")
+    
+    return df
+
+
 class FeatureRegistrationError(Exception):
     """Feature registration error"""
     pass
@@ -129,6 +171,22 @@ class FeatureSelector:
         """Check if feature was selected by discovery"""
         with self._lock:
             return feature_name in self.selected_features
+    
+    def sync_with_discovery(self, discovery: 'Discovery') -> None:
+        """Sync selected features from Discovery instance"""
+        if not hasattr(discovery, '_indicator_metrics'):
+            return
+        
+        with self._lock:
+            for name, metric in discovery._indicator_metrics.items():
+                meta = FeatureMetadata(
+                    name=name,
+                    category=metric.category.value if hasattr(metric.category, 'value') else str(metric.category),
+                    discovery_score=metric.composite_score()
+                )
+                self.selected_features[name] = meta
+        
+        logger.info(f"Synced {len(self.selected_features)} features from Discovery")
 
 
 feature_selector = FeatureSelector()
@@ -646,7 +704,10 @@ def engineer_features_for_timeframe(
     compute_advanced: bool = True,
     use_discovery: bool = True,
     discovery_config: Optional[Dict[str, Any]] = None,
-    normalize: bool = False
+    normalize: bool = False,
+    scaler_type: str = 'standard',
+    fill_missing: str = 'interpolate',
+    discovery_top_n: int = 10
 ) -> Tuple[pd.DataFrame, Dict[str, FeatureMetadata]]:
     """
     Engineer all features for a given timeframe.
@@ -658,9 +719,12 @@ def engineer_features_for_timeframe(
         use_discovery: Whether to use discovery module (default True)
         discovery_config: Discovery configuration dict
         normalize: Whether to normalize features (default False)
+        scaler_type: Type of scaler ('standard', 'robust', 'minmax') (default 'standard')
+        fill_missing: Method for filling missing values ('interpolate', 'ffill') (default 'interpolate')
+        discovery_top_n: Top N features to select from discovery (default 10)
         
     Returns:
-        Tuple of (enhanced DataFrame, feature metadata dict)
+        Tuple of (enhanced DataFrame, feature metadata dict with discovery scores)
         
     Raises:
         FeatureEngineeringError: If required columns missing or invalid data
@@ -671,6 +735,9 @@ def engineer_features_for_timeframe(
         - Fix #1.3: Single df.copy() at start
         - Fix #1.4: Centralized register_feature calls
         - Fix #1.6: Epsilon in divisions to prevent Inf
+        - Enhancement #1: Discovery-driven feature selection
+        - Enhancement #2: Advanced normalization with RobustScaler
+        - Enhancement #3: Intelligent missing value handling with interpolation
     """
     
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -686,10 +753,53 @@ def engineer_features_for_timeframe(
         df_feat = df.copy()
         df_feat = df_feat.astype({col: float for col in required_cols}, errors='ignore')
         
+        # Enhancement #3: Handle missing values with interpolation
+        if fill_missing == 'interpolate' and df_feat.index.dtype == 'datetime64[ns]':
+            df_feat = _interpolate_missing_values(df_feat, timeframe, fill_missing)
+        
         logger.info(f"engineer_features: {len(df_feat)} rows, timeframe={timeframe}")
         
         # Track generated features for centralized registration
         generated_features = []
+        
+        # Pre-phase: Discover indicators first if enabled
+        discovered_features = {}
+        if use_discovery and HAS_DISCOVERY:
+            try:
+                discovery = Discovery(**discovery_config) if discovery_config else Discovery()
+                logger.info("Running discovery phase to identify best features...")
+                
+                # First compute basic features for discovery analysis
+                df_discovery = df_feat.copy()
+                
+                # Add basic indicators for discovery
+                df_discovery["rsi_14"] = compute_rsi(df_discovery["close"], period=14)
+                macd, signal, hist = compute_macd(df_discovery["close"])
+                df_discovery["macd"] = macd
+                df_discovery["macd_signal"] = signal
+                df_discovery["macd_histogram"] = hist
+                
+                if compute_advanced:
+                    k, d = compute_stochastic(df_discovery["high"], df_discovery["low"], df_discovery["close"])
+                    df_discovery["stoch_k"] = k
+                    df_discovery["stoch_d"] = d
+                
+                # Run discovery
+                discovered = discovery.discover_indicators(df_discovery, target_column="return_1bar", min_score=0.4)
+                feature_selector.sync_with_discovery(discovery)
+                
+                # Select top N features
+                top_features = sorted(discovered.items(), key=lambda x: x[1].composite_score(), reverse=True)[:discovery_top_n]
+                for name, metric in top_features:
+                    discovered_features[name] = metric.composite_score()
+                
+                logger.info(f"Discovery: identified {len(discovered_features)} top features")
+                for name, score in discovered_features.items():
+                    logger.debug(f"  {name}: {score:.4f}")
+            
+            except Exception as e:
+                logger.warning(f"Indicator discovery failed, continuing without optimization: {e}")
+                discovered_features = {}
         
         # ==================== MOMENTUM INDICATORS ====================
         
@@ -825,15 +935,24 @@ def engineer_features_for_timeframe(
         except (ValueError, TypeError) as e:
             logger.warning(f"Failed to compute volume features: {e}")
         
-        # ==================== DISCOVERY INTEGRATION ====================
+        # ==================== DISCOVERY-DRIVEN FEATURE FILTERING ====================
         
-        if use_discovery and HAS_DISCOVERY:
-            try:
-                discovery = Discovery(**discovery_config) if discovery_config else Discovery()
-                discovered = discovery.discover_indicators(df_feat, target_column="return_1bar", min_score=0.5)
-                logger.info(f"Discovery: found {len(discovered)} high-performing indicators")
-            except Exception as e:
-                logger.warning(f"Indicator discovery failed: {e}")
+        # If discovery was used, only keep selected features + OHLCV
+        if discovered_features:
+            discovery_feature_names = list(discovered_features.keys())
+            generated_feature_names = [f[0] for f in generated_features]
+            
+            cols_to_keep = required_cols.copy()
+            for feat in generated_feature_names:
+                if feat in discovery_feature_names or feat in discovered_features:
+                    cols_to_keep.append(feat)
+            
+            cols_to_keep = list(set(cols_to_keep))
+            cols_to_keep = [c for c in cols_to_keep if c in df_feat.columns]
+            
+            if cols_to_keep:
+                df_feat = df_feat[cols_to_keep]
+                logger.info(f"Filtered to {len(cols_to_keep)} features based on discovery results")
         
         # ==================== FIX #1.2: COMPREHENSIVE NAN/INF HANDLING ====================
         
@@ -849,24 +968,43 @@ def engineer_features_for_timeframe(
         # ==================== OPTIONAL NORMALIZATION ====================
         
         if normalize:
-            from sklearn.preprocessing import StandardScaler
-            scaler = StandardScaler()
-            numeric_cols = df_feat.select_dtypes(include=[np.number]).columns
-            df_feat[numeric_cols] = scaler.fit_transform(df_feat[numeric_cols])
-            logger.info("Features normalized using StandardScaler")
+            try:
+                scaler = _get_scaler(scaler_type)
+                numeric_cols = df_feat.select_dtypes(include=[np.number]).columns
+                df_feat[numeric_cols] = scaler.fit_transform(df_feat[numeric_cols])
+                logger.info(f"Features normalized using {scaler_type.capitalize()}Scaler")
+            except Exception as e:
+                logger.warning(f"Normalization failed: {e}")
         
         # ==================== FIX #1.4: CENTRALIZED FEATURE REGISTRATION ====================
         
+        # Build metadata dictionary
+        feature_metadata = {}
         for feat_name, category in generated_features:
             try:
                 register_feature(feat_name, category=category, requires_shift=False)
+                discovery_score = discovered_features.get(feat_name, 0.0)
+                feature_metadata[feat_name] = FeatureMetadata(
+                    name=feat_name,
+                    category=category,
+                    discovery_score=discovery_score
+                )
             except Exception as e:
                 logger.debug(f"Failed to register {feat_name}: {e}")
         
-        feature_count = len([c for c in df_feat.columns if c not in df.columns])
-        logger.info(f"engineer_features: generated {feature_count} features")
+        # Add selected features from discovery
+        for feat_name, score in discovered_features.items():
+            if feat_name not in feature_metadata:
+                feature_metadata[feat_name] = FeatureMetadata(
+                    name=feat_name,
+                    category='discovered',
+                    discovery_score=score
+                )
         
-        return df_feat, {}
+        feature_count = len([c for c in df_feat.columns if c not in df.columns])
+        logger.info(f"engineer_features: generated {feature_count} features with {len(feature_metadata)} metadata entries")
+        
+        return df_feat, feature_metadata
     
     except FeatureEngineeringError:
         raise
