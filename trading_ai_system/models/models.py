@@ -1,6 +1,6 @@
 """
-Trading AI System - Models Module (v79.2)
-ML models, ensemble methods, prediction infrastructure
+Trading AI System - Models Module (v79.3)
+ML models, ensemble methods, prediction infrastructure with discovery integration.
 """
 
 import sys
@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from threading import RLock
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -33,7 +34,6 @@ except ImportError:
 
 @dataclass
 class FeatureImportance:
-    """Feature importance analysis result."""
     feature_name: str
     importance_score: float
     normalized_score: float = 0.0
@@ -56,28 +56,23 @@ class FeatureImportance:
 
 
 class ModelError(TradingSystemError):
-    """Base model error."""
     pass
 
 
 class ModelInferenceError(ModelError):
-    """Model inference/prediction error."""
     pass
 
 
 class ModelTrainingError(ModelError):
-    """Model training error."""
     pass
 
 
 class ModelValidationError(ModelError):
-    """Model validation error."""
     pass
 
 
 @dataclass
 class PredictionResult:
-    """Model prediction result."""
     prediction: int
     probability: float
     timestamp: Optional[datetime] = None
@@ -99,7 +94,6 @@ class PredictionResult:
 
 @dataclass
 class ModelMetrics:
-    """Model performance metrics."""
     accuracy: float = 0.0
     precision: float = 0.0
     recall: float = 0.0
@@ -125,9 +119,6 @@ class ModelMetrics:
             "feature_importance": self.feature_importance,
         }
     
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), default=str)
-    
     def is_valid(self) -> bool:
         return (0 <= self.accuracy <= 1 and 
                 0 <= self.precision <= 1 and 
@@ -136,12 +127,12 @@ class ModelMetrics:
 
 @dataclass
 class ModelCheckpoint:
-    """Model checkpoint/version."""
     timestamp: datetime
     version: str
     metrics: ModelMetrics
     params: Dict[str, Any] = field(default_factory=dict)
     feature_importance: Dict[str, FeatureImportance] = field(default_factory=dict)
+    discovered_features: List[Dict[str, Any]] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -150,15 +141,11 @@ class ModelCheckpoint:
             "metrics": self.metrics.to_dict(),
             "params": self.params,
             "feature_importance": {k: v.to_dict() for k, v in self.feature_importance.items()},
+            "discovered_features": self.discovered_features,
         }
-    
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), default=str)
 
 
 class BaseModel(ABC):
-    """Abstract base class for all models."""
-    
     def __init__(self, name: str, version: str = "1.0"):
         self.name = name
         self.version = version
@@ -174,31 +161,25 @@ class BaseModel(ABC):
     
     @abstractmethod
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> 'BaseModel':
-        """Train model."""
         pass
     
     @abstractmethod
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Make predictions."""
         pass
     
     @abstractmethod
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Get prediction probabilities."""
         pass
     
     def set_metrics(self, metrics: ModelMetrics) -> None:
-        """Set model metrics."""
         with self._lock:
             self.metrics = metrics
     
     def get_metrics(self) -> ModelMetrics:
-        """Get model metrics."""
         with self._lock:
             return self.metrics
     
     def set_feature_importance(self, feature_importance: Dict[str, float]) -> None:
-        """Set feature importance."""
         with self._lock:
             self.feature_importance = {}
             total = sum(feature_importance.values()) if feature_importance else 1.0
@@ -213,12 +194,10 @@ class BaseModel(ABC):
                 )
     
     def get_feature_importance(self) -> Dict[str, FeatureImportance]:
-        """Get feature importance."""
         with self._lock:
             return self.feature_importance.copy()
     
     def get_top_features(self, top_n: int = 10) -> List[Dict[str, Any]]:
-        """Get top N most important features."""
         with self._lock:
             sorted_features = sorted(
                 self.feature_importance.values(),
@@ -227,37 +206,74 @@ class BaseModel(ABC):
             )
             return [f.to_dict() for f in sorted_features[:top_n]]
     
-    def create_checkpoint(self, metrics: Optional[ModelMetrics] = None) -> ModelCheckpoint:
-        """Create model checkpoint."""
+    def sync_with_discovery(self, discovered_features: List[Dict[str, Any]], top_n: int = 20) -> None:
+        """Mark features discovered by discovery module"""
+        with self._lock:
+            discovered_names = {f['name'] for f in discovered_features[:top_n]}
+            for feat_name, feat_obj in self.feature_importance.items():
+                if feat_name in discovered_names:
+                    feat_obj.discovered = True
+                    for disc_feat in discovered_features:
+                        if disc_feat['name'] == feat_name:
+                            feat_obj.category = disc_feat.get('category', '')
+                            break
+    
+    def create_checkpoint(self, metrics: Optional[ModelMetrics] = None, discovered_features: Optional[List[Dict[str, Any]]] = None) -> ModelCheckpoint:
         checkpoint = ModelCheckpoint(
             timestamp=datetime.now(timezone.utc),
             version=self.version,
             metrics=metrics or self.metrics,
-            feature_importance=self.feature_importance.copy()
+            feature_importance=self.feature_importance.copy(),
+            discovered_features=discovered_features or []
         )
-        
         with self._lock:
             self.checkpoints.append(checkpoint)
         logger.info(f"Checkpoint created for {self.name} v{self.version}")
         return checkpoint
     
     def get_best_checkpoint(self) -> Optional[ModelCheckpoint]:
-        """Get best checkpoint by F1 score."""
         with self._lock:
             if not self.checkpoints:
                 return None
             return max(self.checkpoints, key=lambda c: c.metrics.f1_score)
     
     def add_training_history(self, epoch: int, loss: float, accuracy: float) -> None:
-        """Add training history."""
         with self._lock:
             self.training_history["loss"].append(loss)
             self.training_history["accuracy"].append(accuracy)
+    
+    def save(self, path: Union[str, Path]) -> None:
+        """Save model to disk"""
+        try:
+            import joblib
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(self, path)
+            logger.info(f"Model saved to {path}")
+        except ImportError:
+            logger.error("joblib not installed for model serialization")
+        except Exception as e:
+            logger.error(f"Failed to save model: {e}")
+    
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> 'BaseModel':
+        """Load model from disk"""
+        try:
+            import joblib
+            path = Path(path)
+            model = joblib.load(path)
+            logger.info(f"Model loaded from {path}")
+            return model
+        except ImportError:
+            logger.error("joblib not installed for model deserialization")
+        except FileNotFoundError:
+            logger.error(f"Model file not found: {path}")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+        return None
 
 
 class LightGBMModel(BaseModel):
-    """LightGBM model wrapper."""
-    
     def __init__(self, name: str = "lgb_model", version: str = "1.0", **kwargs):
         super().__init__(name, version)
         self.model = None
@@ -266,7 +282,6 @@ class LightGBMModel(BaseModel):
         self._init_lgb()
     
     def _init_lgb(self) -> None:
-        """Initialize LightGBM safely."""
         try:
             import lightgbm as lgb
             self._lgb = lgb
@@ -274,7 +289,6 @@ class LightGBMModel(BaseModel):
             logger.warning("LightGBM not installed")
     
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> 'LightGBMModel':
-        """Train LightGBM model."""
         if self._lgb is None:
             raise ModelTrainingError("LightGBM not installed")
         
@@ -290,6 +304,8 @@ class LightGBMModel(BaseModel):
                 }
                 params.update(self.params)
                 
+                importance_type = params.pop('importance_type', 'gain')
+                
                 train_data = self._lgb.Dataset(X_train, label=y_train)
                 
                 self.model = self._lgb.train(
@@ -299,7 +315,7 @@ class LightGBMModel(BaseModel):
                     **kwargs
                 )
                 
-                importances = self.model.feature_importance()
+                importances = self.model.feature_importance(importance_type=importance_type)
                 feature_importance = dict(zip(X_train.columns, importances))
                 self.set_feature_importance(feature_importance)
                 
@@ -312,7 +328,6 @@ class LightGBMModel(BaseModel):
             raise ModelTrainingError(f"Training failed: {e}")
     
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Get class predictions."""
         if not self.is_trained or self.model is None:
             raise ModelInferenceError("Model not trained")
         
@@ -324,7 +339,6 @@ class LightGBMModel(BaseModel):
             raise ModelInferenceError(f"Prediction failed: {e}")
     
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Get prediction probabilities."""
         if not self.is_trained or self.model is None:
             raise ModelInferenceError("Model not trained")
         
@@ -336,15 +350,12 @@ class LightGBMModel(BaseModel):
 
 
 class EnsembleModel(BaseModel):
-    """Ensemble of multiple models."""
-    
     def __init__(self, name: str = "ensemble", models: Optional[List[BaseModel]] = None, version: str = "1.0"):
         super().__init__(name, version)
         self.models = models or []
         self.weights = [1.0 / len(self.models)] if self.models else []
     
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> 'EnsembleModel':
-        """Train all ensemble models."""
         try:
             with self._lock:
                 logger.info(f"Training {len(self.models)} models in ensemble")
@@ -374,24 +385,33 @@ class EnsembleModel(BaseModel):
             raise ModelTrainingError(f"Ensemble training failed: {e}")
     
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Get ensemble predictions."""
         if not self.is_trained:
             raise ModelInferenceError("Ensemble not trained")
         
         try:
             with self._lock:
                 preds = np.array([m.predict(X) for m in self.models])
-                return np.apply_along_axis(
-                    lambda x: np.argmax(np.bincount(x.astype(int))),
-                    axis=0,
-                    arr=preds
-                )
+                
+                voted = np.zeros(preds.shape[1], dtype=int)
+                for i in range(preds.shape[1]):
+                    votes = preds[:, i]
+                    unique, counts = np.unique(votes, return_counts=True)
+                    max_count = counts.max()
+                    tied = unique[counts == max_count]
+                    
+                    if len(tied) == 1:
+                        voted[i] = tied[0]
+                    else:
+                        probas = np.array([m.predict_proba(X.iloc[[i]]) for m in self.models])
+                        avg_proba = probas.mean(axis=0).flatten()
+                        voted[i] = np.argmax(avg_proba) - 1
+                
+                return voted
         
         except Exception as e:
             raise ModelInferenceError(f"Ensemble prediction failed: {e}")
     
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Get ensemble probabilities."""
         if not self.is_trained:
             raise ModelInferenceError("Ensemble not trained")
         
@@ -404,7 +424,6 @@ class EnsembleModel(BaseModel):
             raise ModelInferenceError(f"Ensemble probability failed: {e}")
     
     def set_weights(self, weights: List[float]) -> None:
-        """Set ensemble weights."""
         if len(weights) != len(self.models):
             raise ValueError(f"Expected {len(self.models)} weights")
         
@@ -414,8 +433,6 @@ class EnsembleModel(BaseModel):
 
 
 class MetaModel(BaseModel):
-    """Meta learner for stacking ensemble."""
-    
     def __init__(
         self,
         name: str = "meta_model",
@@ -429,7 +446,6 @@ class MetaModel(BaseModel):
         self.is_trained_base = False
     
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> 'MetaModel':
-        """Train stacking model."""
         try:
             with self._lock:
                 logger.info(f"Training {len(self.base_models)} base models")
@@ -461,7 +477,6 @@ class MetaModel(BaseModel):
             raise ModelTrainingError(f"Meta model training failed: {e}")
     
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Get meta model predictions."""
         if not self.is_trained:
             raise ModelInferenceError("Meta model not trained")
         
@@ -478,7 +493,6 @@ class MetaModel(BaseModel):
             raise ModelInferenceError(f"Meta prediction failed: {e}")
     
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Get meta model probabilities."""
         if not self.is_trained:
             raise ModelInferenceError("Meta model not trained")
         
@@ -496,20 +510,23 @@ class MetaModel(BaseModel):
 
 
 class IsotonicCalibrator(BaseModel):
-    """Isotonic regression calibration."""
-    
     def __init__(self, name: str = "isotonic_calibrator", version: str = "1.0"):
         super().__init__(name, version)
         self.calibrator = None
     
-    def fit(self, y_true: np.ndarray, y_pred: np.ndarray, **kwargs) -> 'IsotonicCalibrator':
-        """Train calibrator."""
+    def fit(self, X_train: pd.DataFrame, y_train: pd.Series, **kwargs) -> 'IsotonicCalibrator':
+        """
+        Fit calibrator with model predictions and true labels.
+        X_train should contain model predictions, y_train contains true labels.
+        """
         try:
             from sklearn.isotonic import IsotonicRegression
             
+            y_pred = X_train.values.flatten() if isinstance(X_train, pd.DataFrame) else X_train
+            
             with self._lock:
                 self.calibrator = IsotonicRegression(out_of_bounds='clip')
-                self.calibrator.fit(y_pred, y_true)
+                self.calibrator.fit(y_pred, y_train)
                 self.is_trained = True
                 logger.info("Trained isotonic calibrator")
             
@@ -521,11 +538,9 @@ class IsotonicCalibrator(BaseModel):
             raise ModelTrainingError(f"Calibration failed: {e}")
     
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Not implemented for calibrator."""
         raise NotImplementedError("Use predict_proba")
     
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Calibrate probabilities."""
         if not self.is_trained or self.calibrator is None:
             raise ModelInferenceError("Calibrator not trained")
         
@@ -542,7 +557,6 @@ def calculate_metrics(
     y_proba: Optional[np.ndarray] = None,
     feature_importance: Optional[Dict[str, float]] = None
 ) -> ModelMetrics:
-    """Calculate model performance metrics."""
     try:
         from sklearn.metrics import (
             accuracy_score, precision_score, recall_score,
@@ -577,7 +591,6 @@ def calculate_metrics(
 
 
 def get_feature_importance(model: BaseModel, feature_names: List[str]) -> Dict[str, float]:
-    """Extract feature importance from model."""
     try:
         importance_dict = {}
         
@@ -601,13 +614,13 @@ def get_feature_importance(model: BaseModel, feature_names: List[str]) -> Dict[s
 
 
 def get_discovered_features(feature_importance: Dict[str, FeatureImportance]) -> List[Dict[str, Any]]:
-    """Get discovered high-importance features."""
     discovered = [
         {
             'name': feat.feature_name,
             'score': feat.importance_score,
             'normalized': feat.normalized_score,
-            'rank': feat.rank
+            'rank': feat.rank,
+            'category': feat.category,
         }
         for feat in feature_importance.values()
         if feat.discovered or feat.normalized_score > 0.05

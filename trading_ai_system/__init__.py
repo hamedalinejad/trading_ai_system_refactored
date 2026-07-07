@@ -10,14 +10,14 @@ Supports:
 - Data fetching and feature engineering
 - Automated indicator discovery and analysis
 
-v79.2 - Enhanced with indicator discovery and feature importance analysis
+v79.4 - Enhanced module loading, discovery integration, caching, persistence
 """
 
 import sys
 import logging
 from pathlib import Path
+from typing import Dict, Any, Optional
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -25,116 +25,192 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Version info
-from trading_ai_system.__version__ import (
-    __version__,
-    __author__,
-    __description__,
-)
-
-# Core utilities
-from trading_ai_system.core import (
-    TradingSystemError,
-    get_global_config,
-)
-
-# Import subpackages - lazy load to avoid dependency issues
 try:
-    from trading_ai_system import core
-except ImportError as e:
-    logger.warning(f"Failed to import core module: {e}")
-    core = None
+    from trading_ai_system.__version__ import (
+        __version__,
+        __author__,
+        __description__,
+    )
+except ImportError:
+    __version__ = "0.79.4"
+    __author__ = "Hamed Alinejad"
+    __description__ = "Trading AI System with ML and Discovery"
 
 try:
-    from trading_ai_system import data
+    from trading_ai_system.core import (
+        TradingSystemError,
+        get_global_config,
+        register_feature,
+        get_logger,
+    )
 except ImportError as e:
-    logger.warning(f"Failed to import data module: {e}")
-    data = None
-
-try:
-    from trading_ai_system import features
-except ImportError as e:
-    logger.warning(f"Failed to import features module: {e}")
-    features = None
-
-try:
-    from trading_ai_system import models
-except ImportError as e:
-    logger.warning(f"Failed to import models module: {e}")
-    models = None
-
-try:
-    from trading_ai_system import discovery
-except ImportError as e:
-    logger.warning(f"Failed to import discovery module: {e}")
-    discovery = None
-
-try:
-    from trading_ai_system import strategy
-except ImportError as e:
-    logger.warning(f"Failed to import strategy module: {e}")
-    strategy = None
-
-try:
-    from trading_ai_system import risk
-except ImportError as e:
-    logger.warning(f"Failed to import risk module: {e}")
-    risk = None
-
-try:
-    from trading_ai_system import live
-except ImportError as e:
-    logger.warning(f"Failed to import live module: {e}")
-    live = None
-
-try:
-    from trading_ai_system import utils
-except ImportError as e:
-    logger.warning(f"Failed to import utils module: {e}")
-    utils = None
+    logger.error(f"Critical: Failed to import core module: {e}")
+    TradingSystemError = Exception
+    def get_global_config():
+        return {}
+    def register_feature(*args, **kwargs):
+        pass
+    def get_logger(name):
+        return logging.getLogger(name)
 
 
-def get_system_info() -> dict:
-    """Get system information and configuration.
+class ModuleLoader:
+    """Lazy load submodules with error handling"""
     
-    Returns:
-        dict: System info including version, config, and module status
-    """
+    def __init__(self):
+        self._modules: Dict[str, Optional[Any]] = {}
+        self._errors: Dict[str, str] = {}
+        self._load_all()
+    
+    def _load_all(self) -> None:
+        """Load all submodules"""
+        module_names = ['core', 'data', 'features', 'models', 'discovery', 'strategy', 'risk', 'live', 'utils']
+        
+        for module_name in module_names:
+            try:
+                self._modules[module_name] = __import__(f'trading_ai_system.{module_name}', fromlist=[module_name])
+                logger.debug(f"Loaded module: {module_name}")
+            except ImportError as e:
+                self._modules[module_name] = None
+                self._errors[module_name] = str(e)
+                logger.warning(f"Failed to import {module_name}: {e}")
+            except Exception as e:
+                self._modules[module_name] = None
+                self._errors[module_name] = str(e)
+                logger.error(f"Error loading {module_name}: {e}")
+    
+    def get(self, module_name: str) -> Optional[Any]:
+        """Get loaded module"""
+        return self._modules.get(module_name)
+    
+    def get_status(self) -> Dict[str, bool]:
+        """Get module loading status"""
+        return {name: mod is not None for name, mod in self._modules.items()}
+    
+    def get_errors(self) -> Dict[str, str]:
+        """Get module loading errors"""
+        return self._errors.copy()
+
+
+_loader = ModuleLoader()
+
+core = _loader.get('core')
+data = _loader.get('data')
+features = _loader.get('features')
+models = _loader.get('models')
+discovery = _loader.get('discovery')
+strategy = _loader.get('strategy')
+risk = _loader.get('risk')
+live = _loader.get('live')
+utils = _loader.get('utils')
+
+
+def get_system_info() -> Dict[str, Any]:
+    """Get system information and configuration"""
     try:
         config = get_global_config()
-    except:
+    except Exception:
         config = {}
-    
-    modules_status = {
-        "core": core is not None,
-        "data": data is not None,
-        "features": features is not None,
-        "models": models is not None,
-        "discovery": discovery is not None,
-        "strategy": strategy is not None,
-        "risk": risk is not None,
-        "live": live is not None,
-        "utils": utils is not None,
-    }
     
     return {
         "version": __version__,
         "author": __author__,
         "description": __description__,
         "python_version": sys.version,
-        "modules": modules_status,
+        "modules": _loader.get_status(),
         "config": config,
     }
 
 
-# Public API
+def get_module_errors() -> Dict[str, str]:
+    """Get module loading errors"""
+    return _loader.get_errors()
+
+
+def verify_modules(required: Optional[list] = None) -> bool:
+    """
+    Verify required modules are loaded.
+    
+    Args:
+        required: List of required module names. If None, checks all.
+        
+    Returns:
+        True if all required modules loaded, False otherwise
+    """
+    status = _loader.get_status()
+    
+    if required is None:
+        required = list(status.keys())
+    
+    missing = [m for m in required if not status.get(m, False)]
+    
+    if missing:
+        logger.error(f"Missing required modules: {missing}")
+        return False
+    
+    return True
+
+
+def initialize_system(
+    enable_discovery: bool = True,
+    enable_caching: bool = True,
+    enable_logging: bool = True
+) -> bool:
+    """
+    Initialize trading system with options.
+    
+    Args:
+        enable_discovery: Enable indicator discovery module
+        enable_caching: Enable feature caching
+        enable_logging: Enable system logging
+        
+    Returns:
+        True if initialization successful
+    """
+    try:
+        if enable_logging:
+            logger.info(f"Initializing Trading AI System v{__version__}")
+        
+        status = _loader.get_status()
+        
+        if enable_discovery and not status.get('discovery'):
+            logger.warning("Discovery module not available")
+        
+        if enable_caching and features:
+            try:
+                features.feature_cache.enable_caching = True
+                if enable_logging:
+                    logger.info("Feature caching enabled")
+            except AttributeError:
+                logger.warning("Feature cache not available")
+        
+        if enable_logging:
+            logger.info(f"System initialized: {sum(status.values())}/{len(status)} modules loaded")
+        
+        return all(status.values())
+    
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}")
+        return False
+
+
+def get_pipeline() -> Dict[str, Any]:
+    """Get standard pipeline configuration"""
+    return {
+        "data_loader": data,
+        "feature_engineer": features,
+        "discovery": discovery,
+        "model": models,
+        "strategy": strategy,
+        "risk_manager": risk,
+        "live_trader": live,
+    }
+
+
 __all__ = [
-    # Version & metadata
     "__version__",
     "__author__",
     "__description__",
-    
-    # Subpackages
     "core",
     "data",
     "features",
@@ -144,35 +220,24 @@ __all__ = [
     "risk",
     "live",
     "utils",
-    
-    # Core exports
     "TradingSystemError",
     "get_global_config",
-    
-    # Functions
+    "register_feature",
+    "get_logger",
     "get_system_info",
+    "get_module_errors",
+    "verify_modules",
+    "initialize_system",
+    "get_pipeline",
 ]
 
+logger.info(f"Trading AI System v{__version__} loaded")
+status = _loader.get_status()
+loaded_count = sum(status.values())
+total_count = len(status)
+logger.info(f"Modules: {loaded_count}/{total_count} loaded successfully")
 
-# Initialize logging
-logger.info(f"Trading AI System v{__version__} initialized")
-logger.debug(f"Author: {__author__}")
-logger.debug(f"Description: {__description__}")
-
-# Verify module imports
-missing_modules = [name for name, loaded in {
-    "core": core,
-    "data": data,
-    "features": features,
-    "models": models,
-    "discovery": discovery,
-    "strategy": strategy,
-    "risk": risk,
-    "live": live,
-    "utils": utils,
-}.items() if loaded is None]
-
-if missing_modules:
-    logger.warning(f"Some modules failed to import: {missing_modules}")
-else:
-    logger.info("All modules loaded successfully")
+if loaded_count < total_count:
+    errors = _loader.get_errors()
+    for module, error in errors.items():
+        logger.debug(f"{module}: {error}")
