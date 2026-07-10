@@ -18,12 +18,51 @@ from trading_ai_system.core.core import (
     DataFrameValidator,
     HealthCheck,
     load_json_config,
+    save_json_config,
+    load_config_from_env,
     ensure_path,
     get_file_hash,
     validate_mapping,
     validate_sequence,
     validate_mutable_mapping,
+    validate_dataframe,
+    timeframe_to_minutes,
+    minutes_to_timeframe,
+    feature_registry,
+    system_health,
+    json_config_encoder,
+    JSONConfigEncoder,
+    TradingSystemError,
+    ConfigError,
+    DataError,
+    FeatureError,
+    ModelError,
+    ExecutionError,
+    StrategyError,
+    RiskError,
+    LiveTradingError,
+    get_global_state,
+    get_global_config,
+    set_global_config,
+    initialize_system,
+    shutdown_system,
+    config_context,
+    get_request_config,
+    set_request_config,
+    clear_request_config,
 )
+
+
+# Wrapper function for backward compatibility
+def register_feature(name: str, **kwargs):
+    """Register a feature (wrapper around feature_registry)."""
+    return feature_registry(name, register=True, value=kwargs)
+
+
+def get_feature_registry():
+    """Get feature registry (wrapper around feature_registry)."""
+    return feature_registry()
+
 
 __all__ = [
     "__version__",
@@ -45,9 +84,38 @@ __all__ = [
     "DataFrameValidator",
     "HealthCheck",
     "load_json_config",
+    "save_json_config",
+    "load_config_from_env",
     "ensure_path",
     "get_file_hash",
     "validate_mapping",
     "validate_sequence",
     "validate_mutable_mapping",
+    "validate_dataframe",
+    "timeframe_to_minutes",
+    "minutes_to_timeframe",
+    "feature_registry",
+    "get_feature_registry",
+    "register_feature",
+    "system_health",
+    "json_config_encoder",
+    "JSONConfigEncoder",
+    "TradingSystemError",
+    "ConfigError",
+    "DataError",
+    "FeatureError",
+    "ModelError",
+    "ExecutionError",
+    "StrategyError",
+    "RiskError",
+    "LiveTradingError",
+    "get_global_state",
+    "get_global_config",
+    "set_global_config",
+    "initialize_system",
+    "shutdown_system",
+    "config_context",
+    "get_request_config",
+    "set_request_config",
+    "clear_request_config",
 ]

@@ -549,7 +549,7 @@ class TestStrategyEdgeCases:
         prices_series = pd.Series(prices)
         
         # پر کردن NaN
-        prices_filled = prices_series.fillna(method='ffill')
+        prices_filled = prices_series.ffill()
         
         assert prices_filled.notna().all()
     

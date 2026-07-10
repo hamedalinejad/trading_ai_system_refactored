@@ -596,16 +596,26 @@ class LRUCache:
             self._timestamps.clear()
 
 
-def hash_string(text: str) -> str:
-    """Hash a string using SHA256.
+def hash_string(text: str, algorithm: str = "sha256") -> str:
+    """Hash a string using specified algorithm.
     
     Args:
         text: String to hash.
+        algorithm: Hash algorithm ('sha256', 'md5', 'sha512').
     
     Returns:
-        Hexadecimal SHA256 hash.
+        Hexadecimal hash.
+    
+    Raises:
+        ValueError: If algorithm is not supported.
     """
-    return hashlib.sha256(text.encode()).hexdigest()
+    supported = {"sha256", "md5", "sha512"}
+    if algorithm not in supported:
+        raise ValueError(f"Unsupported algorithm: {algorithm}. Supported: {supported}")
+    
+    hasher = hashlib.new(algorithm)
+    hasher.update(text.encode())
+    return hasher.hexdigest()
 
 
 def get_timestamp_utc() -> str:
@@ -785,6 +795,27 @@ def load_config_from_env(prefix: str = "TRADING_") -> SystemConfig:
     return SystemConfig()
 
 
+def save_json_config(data: Dict[str, Any], path: Union[str, Path]) -> None:
+    """Save JSON configuration file.
+    
+    Args:
+        data: Dictionary to save as JSON.
+        path: Path to save JSON config file.
+    
+    Raises:
+        ConfigError: If save fails.
+    """
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump(data, f, cls=JSONConfigEncoder, indent=2)
+        logger.info(f"Config saved to {path}")
+    except (IOError, TypeError) as e:
+        logger.error(f"Failed to save config to {path}: {e}")
+        raise ConfigError(f"Cannot save config file: {path}") from e
+
+
 def load_json_config(path: Union[str, Path]) -> Dict[str, Any]:
     """Load JSON configuration file.
     
@@ -803,7 +834,10 @@ def load_json_config(path: Union[str, Path]) -> Dict[str, Any]:
             if not isinstance(data, dict):
                 raise ConfigError("Config root must be a dictionary")
             return data
-    except (FileNotFoundError, json.JSONDecodeError) as e:
+    except FileNotFoundError:
+        logger.warning(f"Config file not found: {path}, returning empty dict")
+        return {}
+    except json.JSONDecodeError as e:
         logger.error(f"Failed to load config from {path}: {e}")
         raise ConfigError(f"Invalid config file: {path}") from e
 
@@ -901,6 +935,203 @@ def validate_mutable_mapping(data: Any) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
+def validate_dataframe(df: Any) -> Tuple[bool, List[str]]:
+    """Validate a pandas DataFrame.
+    
+    Args:
+        df: Object to validate as DataFrame.
+    
+    Returns:
+        Tuple of (is_valid, error_list).
+    """
+    errors = []
+    
+    if df is None:
+        errors.append("DataFrame is None")
+        return False, errors
+    
+    if not isinstance(df, pd.DataFrame):
+        errors.append(f"Expected DataFrame, got {type(df).__name__}")
+        return False, errors
+    
+    if df.empty:
+        errors.append("DataFrame is empty")
+    
+    if df.isnull().any().any():
+        null_cols = df.columns[df.isnull().any()].tolist()
+        errors.append(f"DataFrame contains NaN values in columns: {null_cols}")
+    
+    return len(errors) == 0, errors
+
+
+def timeframe_to_minutes(timeframe: str) -> int:
+    """Convert timeframe string to minutes.
+    
+    Args:
+        timeframe: Timeframe as string (e.g., '1M', '5M', '1H', '4H', '1D', '1W').
+    
+    Returns:
+        Number of minutes.
+    
+    Raises:
+        ValueError: If timeframe format is invalid.
+    """
+    timeframe = timeframe.upper().strip()
+    
+    if not timeframe or len(timeframe) < 2:
+        raise ValueError(f"Invalid timeframe: {timeframe}")
+    
+    number_str = timeframe[:-1]
+    unit = timeframe[-1]
+    
+    try:
+        number = int(number_str)
+    except ValueError:
+        raise ValueError(f"Invalid timeframe number: {number_str}")
+    
+    multipliers = {
+        'M': 1,      # Minutes
+        'H': 60,     # Hours
+        'D': 24*60,  # Days
+        'W': 7*24*60,  # Weeks
+    }
+    
+    if unit not in multipliers:
+        raise ValueError(f"Invalid timeframe unit: {unit}. Must be M/H/D/W")
+    
+    return number * multipliers[unit]
+
+
+def minutes_to_timeframe(minutes: int) -> str:
+    """Convert minutes to timeframe string.
+    
+    Args:
+        minutes: Number of minutes.
+    
+    Returns:
+        Timeframe string (e.g., '1M', '1H', '1D', '1W').
+    
+    Raises:
+        ValueError: If minutes is invalid.
+    """
+    if minutes <= 0:
+        raise ValueError(f"Minutes must be positive, got {minutes}")
+    
+    # Check for weeks
+    if minutes % (7 * 24 * 60) == 0:
+        return f"{minutes // (7 * 24 * 60)}W"
+    
+    # Check for days
+    if minutes % (24 * 60) == 0:
+        return f"{minutes // (24 * 60)}D"
+    
+    # Check for hours
+    if minutes % 60 == 0:
+        return f"{minutes // 60}H"
+    
+    # Minutes
+    return f"{minutes}M"
+
+
+# Thread-safe feature registry
+_feature_registry_lock = Lock()
+_feature_registry: Dict[str, Any] = {}
+
+
+def feature_registry(name: Optional[str] = None, register: bool = False, value: Any = None) -> Union[Dict[str, Any], Any, None]:
+    """Get/register features in thread-safe registry.
+    
+    Args:
+        name: Feature name (if None, returns entire registry copy).
+        register: If True, register the feature.
+        value: Value to register (if register=True).
+    
+    Returns:
+        Registry copy, feature value, or None.
+    """
+    global _feature_registry
+    
+    with _feature_registry_lock:
+        if name is None:
+            return _feature_registry.copy()
+        
+        if register:
+            if not isinstance(name, str):
+                raise ValueError("Feature name must be string")
+            _feature_registry[name] = value
+            return value
+        
+        return _feature_registry.get(name)
+
+
+def system_health() -> Dict[str, Any]:
+    """Get system health status.
+    
+    Returns:
+        Dictionary with health metrics (copy to prevent external modification).
+    """
+    try:
+        config = get_global_config()
+        state = get_global_state()
+        
+        health = {
+            'status': 'healthy',
+            'timestamp': get_timestamp_utc(),
+            'config_loaded': config is not None,
+            'state_initialized': state is not None,
+            'memory_usage': sys.getsizeof(_feature_registry),
+            'features_registered': len(_feature_registry),
+        }
+        
+        return health.copy()
+    except Exception as e:
+        return {
+            'status': 'error',
+            'timestamp': get_timestamp_utc(),
+            'error': str(e),
+        }
+
+
+class JSONConfigEncoder(json.JSONEncoder):
+    """Custom JSON encoder for config objects."""
+    
+    def default(self, obj: Any) -> Any:
+        """Encode special types to JSON-serializable format."""
+        if isinstance(obj, (datetime, pd.Timestamp)):
+            return obj.isoformat()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, Enum):
+            return obj.value
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, set):
+            return list(obj)
+        return super().default(obj)
+
+
+def json_config_encoder(obj: Any) -> str:
+    """Encode object to JSON string with custom encoder.
+    
+    Args:
+        obj: Object to encode.
+    
+    Returns:
+        JSON string.
+    
+    Raises:
+        ValueError: If object cannot be encoded.
+    """
+    try:
+        return json.dumps(obj, cls=JSONConfigEncoder, indent=2)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Cannot encode object to JSON: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # EXPORTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -914,6 +1145,8 @@ __all__ = [
     "config_context", "get_request_config", "set_request_config", "clear_request_config",
     "LRUCache", "hash_string", "get_timestamp_utc", "timestamp_to_utc", "is_utc_aware",
     "DataFrameValidator", "HealthCheck", 
-    "load_json_config", "load_config_from_env", "ensure_path", "get_file_hash",
+    "save_json_config", "load_json_config", "load_config_from_env", "ensure_path", "get_file_hash",
     "validate_mapping", "validate_sequence", "validate_mutable_mapping",
+    "validate_dataframe", "timeframe_to_minutes", "minutes_to_timeframe",
+    "feature_registry", "system_health", "json_config_encoder", "JSONConfigEncoder",
 ]

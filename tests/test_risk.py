@@ -101,10 +101,10 @@ class TestPositionSizing:
         max_position_percentage = 0.1  # 10% of account
         max_position = account_size * max_position_percentage
         
-        calculated_position = 2000
+        calculated_position = 800  # درست: 800 <= 1000
         assert calculated_position <= max_position
         
-        calculated_position = 15000
+        calculated_position = 1500  # اشتباه: 1500 > 1000
         assert calculated_position > max_position
 
 
@@ -122,13 +122,13 @@ class TestStopLossManagement:
     def test_atr_based_stop_loss(self):
         """تست ATR-based Stop Loss"""
         entry_price = 1.1050
-        atr = 0.005  # 50 pips
+        atr = 0.0050  # 50 pips
         atr_multiplier = 2
         
         stop_loss = entry_price - (atr * atr_multiplier)
         
         assert stop_loss < entry_price
-        assert stop_loss == 1.1000
+        assert stop_loss == pytest.approx(1.0950, rel=1e-5)
     
     def test_percentage_stop_loss(self):
         """تست Percentage Stop Loss"""
@@ -147,7 +147,7 @@ class TestStopLossManagement:
         trailing_stop = high_price - trailing_distance
         
         assert trailing_stop > entry_price
-        assert trailing_stop == 1.1150
+        assert trailing_stop == pytest.approx(1.1150, rel=1e-5)
     
     def test_support_level_stop_loss(self):
         """تست Support Level Stop Loss"""
@@ -198,7 +198,7 @@ class TestTakeProfitManagement:
         take_profit_pips = 50  # 50 pips
         take_profit = entry_price + (take_profit_pips * 0.0001)
         
-        assert take_profit == 1.1100
+        assert take_profit == pytest.approx(1.1100, rel=1e-5)
     
     def test_risk_reward_ratio_take_profit(self):
         """تست Take Profit بر اساس Risk-Reward Ratio"""
@@ -210,7 +210,7 @@ class TestTakeProfitManagement:
         reward = risk * 3
         take_profit = entry_price + reward
         
-        assert take_profit == 1.1140
+        assert take_profit == pytest.approx(1.1140, rel=1e-5)
     
     def test_support_resistance_take_profit(self):
         """تست Take Profit بر اساس Resistance Level"""
@@ -225,7 +225,7 @@ class TestTakeProfitManagement:
         take_profit_percentage = 0.10  # 10%
         take_profit = entry_price * (1 + take_profit_percentage)
         
-        assert take_profit == 110
+        assert take_profit == pytest.approx(110, rel=1e-5)
     
     def test_tiered_take_profit(self):
         """تست Tiered Take Profit (چند سطحی)"""
@@ -462,13 +462,14 @@ class TestMoneyManagement:
     def test_drawdown_recovery(self):
         """تست بازیابی از Drawdown"""
         balance_before = 10000
-        loss_amount = -2000
-        balance_after = balance_before + loss_amount
+        loss_amount = 2000  # خسارت (مثبت)
+        balance_after = balance_before - loss_amount  # 8000
         
-        # بازیابی مورد نیاز
-        recovery_needed = loss_amount / balance_after
+        # درصد بازیابی مورد نیاز برای رسیدن دوباره به balance_before
+        recovery_needed = loss_amount / balance_after  # 2000 / 8000 = 0.25 (25%)
         
         assert recovery_needed > 0
+        assert balance_after < balance_before
     
     def test_daily_pnl_tracking(self):
         """تست Daily PnL Tracking"""

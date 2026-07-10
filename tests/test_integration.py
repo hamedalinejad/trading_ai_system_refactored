@@ -59,8 +59,8 @@ class TestDataToFeaturesPipeline:
             'volatility': np.random.uniform(0, 0.05, n_samples)
         })
         
-        # target
-        target = np.random.choice([0, 1], n_samples)
+        # target (as pandas Series to have nunique method)
+        target = pd.Series(np.random.choice([0, 1], n_samples))
         
         assert len(features) == len(target)
         assert features.shape[1] == 5
@@ -256,11 +256,13 @@ class TestBacktestingFullCycle:
         trades = [100, -50, 150, -30]
         fee_per_trade = 5
         
-        # محاسبه خالص
-        net_trades = [t - fee_per_trade if t > 0 else t + fee_per_trade for t in trades]
+        # محاسبه خالص: هر trade هزینه می‌گیرد
+        net_trades = [t - fee_per_trade for t in trades]
         total = sum(net_trades)
         
+        # کل با هزینه‌ها باید کمتر از کل بدون هزینه باشد
         assert total < sum(trades)
+        assert total == sum(trades) - (len(trades) * fee_per_trade)
     
     @pytest.mark.slow
     def test_full_year_backtest(self):
@@ -411,20 +413,21 @@ class TestSystemErrorHandling:
         })
         
         # Handling
-        filled_data = data.fillna(method='ffill')
+        filled_data = data.ffill()
         
         assert filled_data['close'].notna().all()
     
     def test_outlier_detection(self):
         """تست Outlier Detection"""
-        prices = [1.1, 1.1, 1.15, 1.12, 2.0]  # آخری outlier است
+        prices = [1.1, 1.1, 1.15, 1.12, 5.0]  # آخری outlier است (بسیار دور از میانگین)
         
         # Z-score method
         from scipy import stats
         z_scores = np.abs(stats.zscore(prices))
-        outliers = z_scores > 2
+        outliers = z_scores > 1.5  # threshold کمتر برای تشخیص outlier
         
         assert outliers.sum() > 0
+        assert prices[-1] > np.mean(prices[:-1]) * 2  # آخری قیمت بسیار بیشتر است
     
     def test_connection_failure_handling(self):
         """تست مدیریت Connection Failure"""

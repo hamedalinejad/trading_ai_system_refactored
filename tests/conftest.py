@@ -171,12 +171,16 @@ def mock_feature_engineer():
 
 
 @pytest.fixture
-def mock_model():
+def mock_model(sample_features):
     """
-    فیکسچر برای mock کردن Model
+    فیکسچر برای mock کردن Model - return_value متناسب با input
     """
     model = MagicMock()
-    model.predict = MagicMock(return_value=np.array([0, 1, 0]))
+    # Return predictions with correct length
+    def predict_side_effect(X):
+        return np.random.choice([0, 1], len(X))
+    
+    model.predict = MagicMock(side_effect=predict_side_effect)
     model.train = MagicMock(return_value=None)
     model.evaluate = MagicMock(return_value={'accuracy': 0.85})
     return model

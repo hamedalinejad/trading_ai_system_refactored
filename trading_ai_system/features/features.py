@@ -719,7 +719,7 @@ def engineer_features_for_timeframe(
         numeric_cols = df_feat.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             if col not in required_cols:
-                df_feat[col] = df_feat[col].fillna(method='ffill').fillna(0)
+                df_feat[col] = df_feat[col].ffill().fillna(0)
         
         df_feat = df_feat.replace([np.inf, -np.inf], 0)
         
