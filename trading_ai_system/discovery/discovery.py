@@ -338,7 +338,7 @@ class Discovery:
         df: pd.DataFrame,
         indicator_name: str,
         category: IndicatorCategory,
-        target_column: str = "returns",
+        target_column: str = "return_1bar",
         test_size: float = 0.2,
         use_walk_forward: bool = False
     ) -> Optional[IndicatorMetric]:
@@ -447,7 +447,7 @@ class Discovery:
     def discover_indicators(
         self,
         df: pd.DataFrame,
-        target_column: str = "returns",
+        target_column: str = "return_1bar",
         min_score: float = 0.5
     ) -> Dict[str, IndicatorMetric]:
         """
@@ -455,7 +455,7 @@ class Discovery:
         
         Args:
             df: Input DataFrame
-            target_column: Target/returns column
+            target_column: Target/returns column (tries fallbacks if missing)
             min_score: Minimum composite score threshold
             
         Returns:
@@ -465,14 +465,36 @@ class Discovery:
             logger.warning("Empty DataFrame provided to discover_indicators")
             return {}
         
+        # Fallback target columns so discovery works even if only OHLCV is present
+        if target_column not in df.columns:
+            for fallback in ("return_1bar", "returns", "log_return_1bar", "close"):
+                if fallback in df.columns:
+                    if fallback == "close":
+                        df = df.copy()
+                        df["return_1bar"] = df["close"].pct_change().fillna(0)
+                        target_column = "return_1bar"
+                    else:
+                        target_column = fallback
+                    logger.info(f"Using fallback target column: {target_column}")
+                    break
+            else:
+                logger.warning("No suitable target/returns column found")
+                return {}
+        
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         
-        if target_column in numeric_cols:
-            numeric_cols.remove(target_column)
+        # Exclude raw OHLCV and target from being scored as "indicators"
+        exclude = {
+            target_column, "open", "high", "low", "close", "volume", "spread",
+            "is_market_open", "timestamp"
+        }
+        numeric_cols = [c for c in numeric_cols if c not in exclude]
         
         if not numeric_cols:
-            logger.warning("No numeric columns available for discovery")
+            logger.warning("No numeric indicator columns available for discovery")
             return {}
+        
+        logger.info(f"Scoring {len(numeric_cols)} candidate indicators against '{target_column}'")
         
         discovered = {}
         

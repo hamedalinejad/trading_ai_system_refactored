@@ -334,6 +334,99 @@ def compute_stochastic(
         return pd.Series(np.nan, index=idx), pd.Series(np.nan, index=idx)
 
 
+def compute_sma(close: pd.Series, period: int = 20) -> pd.Series:
+    """Simple Moving Average"""
+    try:
+        return close.astype(float).rolling(window=period, min_periods=1).mean()
+    except Exception:
+        return pd.Series(np.nan, index=close.index)
+
+
+def compute_ema(close: pd.Series, period: int = 20) -> pd.Series:
+    """Exponential Moving Average"""
+    try:
+        return close.astype(float).ewm(span=period, adjust=False).mean()
+    except Exception:
+        return pd.Series(np.nan, index=close.index)
+
+
+def compute_roc(close: pd.Series, period: int = 12) -> pd.Series:
+    """Rate of Change"""
+    try:
+        c = close.astype(float)
+        return ((c - c.shift(period)) / (c.shift(period).abs() + 1e-10) * 100).fillna(0)
+    except Exception:
+        return pd.Series(0.0, index=close.index)
+
+
+def compute_cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
+    """Commodity Channel Index"""
+    try:
+        tp = (high.astype(float) + low.astype(float) + close.astype(float)) / 3.0
+        sma = tp.rolling(window=period, min_periods=1).mean()
+        mad = tp.rolling(window=period, min_periods=1).apply(
+            lambda x: np.mean(np.abs(x - x.mean())), raw=True
+        )
+        cci = (tp - sma) / (0.015 * mad + 1e-10)
+        return cci.replace([np.inf, -np.inf], 0).fillna(0)
+    except Exception:
+        return pd.Series(0.0, index=close.index)
+
+
+def compute_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Williams %R"""
+    try:
+        hh = high.astype(float).rolling(window=period, min_periods=1).max()
+        ll = low.astype(float).rolling(window=period, min_periods=1).min()
+        wr = -100 * (hh - close.astype(float)) / (hh - ll + 1e-10)
+        return wr.replace([np.inf, -np.inf], -50).fillna(-50)
+    except Exception:
+        return pd.Series(-50.0, index=close.index)
+
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume"""
+    try:
+        direction = np.sign(close.astype(float).diff()).fillna(0)
+        return (direction * volume.astype(float)).cumsum()
+    except Exception:
+        return pd.Series(0.0, index=close.index)
+
+
+def compute_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Approximate ADX, +DI, -DI"""
+    try:
+        h = high.astype(float)
+        l = low.astype(float)
+        c = close.astype(float)
+        up = h.diff()
+        down = -l.diff()
+        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+        tr = pd.concat(
+            [h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1
+        ).max(axis=1)
+        atr = tr.rolling(window=period, min_periods=1).mean()
+        plus_di = (
+            100
+            * pd.Series(plus_dm, index=h.index).rolling(window=period, min_periods=1).mean()
+            / (atr + 1e-10)
+        )
+        minus_di = (
+            100
+            * pd.Series(minus_dm, index=h.index).rolling(window=period, min_periods=1).mean()
+            / (atr + 1e-10)
+        )
+        dx = (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10) * 100
+        adx = dx.rolling(window=period, min_periods=1).mean()
+        return adx.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
+    except Exception:
+        z = pd.Series(0.0, index=close.index)
+        return z, z, z
+
+
 def detect_engulfing(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
@@ -639,6 +732,60 @@ def engineer_features_for_timeframe(
             generated_features.append(("atr_14", "volatility"))
         except ValueError as e:
             logger.warning(f"Failed to compute ATR: {e}")
+
+        # --- Expanded indicator set for richer discovery ---
+        try:
+            for p in (10, 20, 50):
+                df_feat[f"sma_{p}"] = compute_sma(df_feat["close"], period=p)
+                df_feat[f"ema_{p}"] = compute_ema(df_feat["close"], period=p)
+                generated_features.extend([(f"sma_{p}", "trend"), (f"ema_{p}", "trend")])
+            df_feat["sma_cross"] = (df_feat["sma_10"] > df_feat["sma_50"]).astype(float)
+            df_feat["ema_cross"] = (df_feat["ema_10"] > df_feat["ema_50"]).astype(float)
+            generated_features.extend([("sma_cross", "trend"), ("ema_cross", "trend")])
+        except Exception as e:
+            logger.warning(f"Failed to compute SMA/EMA: {e}")
+
+        try:
+            df_feat["roc_12"] = compute_roc(df_feat["close"], period=12)
+            df_feat["roc_24"] = compute_roc(df_feat["close"], period=24)
+            generated_features.extend([("roc_12", "momentum"), ("roc_24", "momentum")])
+        except Exception as e:
+            logger.warning(f"Failed to compute ROC: {e}")
+
+        try:
+            df_feat["cci_20"] = compute_cci(df_feat["high"], df_feat["low"], df_feat["close"], period=20)
+            generated_features.append(("cci_20", "momentum"))
+        except Exception as e:
+            logger.warning(f"Failed to compute CCI: {e}")
+
+        try:
+            df_feat["williams_r"] = compute_williams_r(
+                df_feat["high"], df_feat["low"], df_feat["close"], period=14
+            )
+            generated_features.append(("williams_r", "momentum"))
+        except Exception as e:
+            logger.warning(f"Failed to compute Williams %R: {e}")
+
+        try:
+            if "volume" in df_feat.columns:
+                df_feat["obv"] = compute_obv(df_feat["close"], df_feat["volume"])
+                generated_features.append(("obv", "volume"))
+        except Exception as e:
+            logger.warning(f"Failed to compute OBV: {e}")
+
+        try:
+            adx, plus_di, minus_di = compute_adx(
+                df_feat["high"], df_feat["low"], df_feat["close"], period=14
+            )
+            df_feat["adx"] = adx
+            df_feat["plus_di"] = plus_di
+            df_feat["minus_di"] = minus_di
+            df_feat["di_cross"] = (plus_di > minus_di).astype(float)
+            generated_features.extend([
+                ("adx", "trend"), ("plus_di", "trend"), ("minus_di", "trend"), ("di_cross", "trend")
+            ])
+        except Exception as e:
+            logger.warning(f"Failed to compute ADX: {e}")
         
         try:
             df_feat = detect_engulfing(df_feat)
@@ -765,6 +912,13 @@ __all__ = [
     'compute_bollinger_bands',
     'compute_atr',
     'compute_stochastic',
+    'compute_sma',
+    'compute_ema',
+    'compute_roc',
+    'compute_cci',
+    'compute_williams_r',
+    'compute_obv',
+    'compute_adx',
     'detect_engulfing',
     'detect_doji',
     'detect_inside_bar',

@@ -27,8 +27,12 @@ import sys
 import signal
 import argparse
 import logging
+import os
+import json
 from pathlib import Path
 from typing import Optional
+
+import pandas as pd
 
 PROJECT_ROOT = Path(__file__).parent.absolute()
 if str(PROJECT_ROOT) not in sys.path:
@@ -171,9 +175,12 @@ For more information, visit: https://github.com/hamedalinejad/trading_ai_system_
     )
 
     discovery_parser = subparsers.add_parser('discovery', help='Indicator discovery')
-    discovery_parser.add_argument('-p', '--pair', type=str, default='EURUSD', help='Trading pair')
-    discovery_parser.add_argument('-d', '--data', type=str, help='Path to data file')
+    discovery_parser.add_argument('-p', '--pair', type=str, default='EURUSD', help='Trading pair / symbol')
+    discovery_parser.add_argument('-d', '--data', type=str, help='Path to data file (csv or parquet)')
     discovery_parser.add_argument('-t', '--top', type=int, default=10, help='Top N indicators')
+    discovery_parser.add_argument('--timeframe', type=str, default='1h', help='Timeframe to use (e.g. 1min, 5min, 1h, 4h, 1d)')
+    discovery_parser.add_argument('--min-samples', type=int, default=100, help='Minimum samples for discovery')
+    discovery_parser.add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: cpu_count-1 or 2)')
 
     system_parser = subparsers.add_parser('system', help='System information')
     system_subparsers = system_parser.add_subparsers(dest='system_command', help='System subcommand')
@@ -203,7 +210,7 @@ def run_interactive_menu() -> int:
 
 
 def handle_discovery_command(args: argparse.Namespace) -> int:
-    """Handle discovery command"""
+    """Handle discovery command - optimized for multi-timeframe parquet on CPU laptops"""
     try:
         from trading_ai_system import discovery, data, features
         
@@ -211,27 +218,138 @@ def handle_discovery_command(args: argparse.Namespace) -> int:
             logger.error("Required modules not available")
             return 1
         
-        logger.info(f"Running discovery for {args.pair}")
-        
-        if args.data:
-            df = data.DataLoader().load_csv(args.data)
-        else:
-            logger.error("Data file required")
+        if not args.data:
+            logger.error("Data file required. Use -d /path/to/file.parquet")
             return 1
         
+        data_path = Path(args.data)
+        if not data_path.exists():
+            logger.error(f"Data file not found: {data_path}")
+            return 1
+        
+        logger.info(f"Running discovery for {args.pair} | timeframe={args.timeframe}")
+        logger.info(f"Loading data from {data_path}")
+        
+        # Support both parquet and csv
+        loader = data.DataLoader()
+        if data_path.suffix.lower() in ('.parquet', '.pq'):
+            df = loader.load_parquet(data_path)
+        else:
+            df = loader.load_csv(data_path)
+        
+        logger.info(f"Loaded {len(df):,} rows | columns: {list(df.columns)}")
+        
+        # Filter by symbol if present
+        if 'symbol' in df.columns:
+            before = len(df)
+            df = df[df['symbol'].astype(str).str.upper() == args.pair.upper()].copy()
+            logger.info(f"Filtered symbol={args.pair}: {before:,} -> {len(df):,} rows")
+        
+        # Filter by timeframe if present (user multi-TF files)
+        if 'timeframe' in df.columns:
+            before = len(df)
+            # Normalize common aliases
+            tf_map = {
+                '1m': '1min', '1min': '1min', 'm1': '1min',
+                '5m': '5min', '5min': '5min', 'm5': '5min',
+                '15m': '15min', '15min': '15min', 'm15': '15min',
+                '30m': '30min', '30min': '30min', 'm30': '30min',
+                '1h': '1h', 'h1': '1h', '60min': '1h',
+                '4h': '4h', 'h4': '4h',
+                '12h': '12h', 'h12': '12h',
+                '1d': '1d', 'd1': '1d', 'daily': '1d',
+            }
+            target_tf = tf_map.get(args.timeframe.lower(), args.timeframe.lower())
+            df['timeframe_norm'] = df['timeframe'].astype(str).str.lower().map(
+                lambda x: tf_map.get(x, x)
+            )
+            df = df[df['timeframe_norm'] == target_tf].copy()
+            df = df.drop(columns=['timeframe_norm'], errors='ignore')
+            logger.info(f"Filtered timeframe={target_tf}: {before:,} -> {len(df):,} rows")
+        
+        if len(df) < args.min_samples:
+            logger.error(f"Not enough data after filtering: {len(df)} < {args.min_samples}")
+            return 1
+        
+        # Optional: keep only market open bars
+        if 'is_market_open' in df.columns:
+            before = len(df)
+            df = df[df['is_market_open'] == 1].copy()
+            logger.info(f"Kept market-open bars: {before:,} -> {len(df):,}")
+        
+        # Sort by timestamp
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.dropna(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+        
+        # Clean OHLCV (drops noise cols like spread/symbol)
         df = data.clean_ohlcv_data(df)
-        df = features.engineer_features_for_timeframe(df, use_discovery=False)[0]
+        logger.info(f"After cleaning: {len(df):,} rows")
         
-        disc = discovery.Discovery()
-        discovered = disc.discover_indicators(df)
+        # Ensure volume exists
+        if 'volume' not in df.columns:
+            df['volume'] = 0.0
+            logger.warning("No volume column; filled with 0")
         
-        top = list(discovered.values())[:args.top]
-        for ind in top:
-            logger.info(f"  {ind.name}: {ind.composite_score():.4f} (wr={ind.win_rate:.2%})")
+        # Engineer features (without recursive discovery)
+        df_feat, meta = features.engineer_features_for_timeframe(
+            df,
+            timeframe=args.timeframe,
+            compute_advanced=True,
+            use_discovery=False,
+            use_cache=True,
+        )
+        logger.info(f"Features engineered: {len(df_feat.columns)} columns")
+        
+        # Configure discovery for laptop CPU
+        n_workers = args.workers
+        if n_workers is None:
+            n_workers = max(1, min(2, (os.cpu_count() or 2) - 0))
+        
+        config = discovery.DiscoveryConfig(
+            min_samples=args.min_samples,
+            parallel_enabled=True,
+            n_workers=n_workers,
+            use_walk_forward=True,
+            caching_enabled=True,
+        )
+        disc = discovery.Discovery(config=config)
+        
+        logger.info(f"Starting indicator discovery (workers={n_workers})...")
+        discovered = disc.discover_indicators(df_feat)
+        
+        if not discovered:
+            logger.warning("No indicators discovered")
+            return 0
+        
+        # Sort by composite score
+        ranked = sorted(
+            discovered.values(),
+            key=lambda x: x.composite_score(),
+            reverse=True
+        )[:args.top]
+        
+        logger.info("=" * 60)
+        logger.info(f"TOP {len(ranked)} DISCOVERED INDICATORS for {args.pair} {args.timeframe}")
+        logger.info("=" * 60)
+        for i, ind in enumerate(ranked, 1):
+            logger.info(
+                f"{i:2d}. {ind.name:30s} | score={ind.composite_score():.4f} "
+                f"| wr={ind.win_rate:.2%} | sharpe={getattr(ind, 'sharpe_ratio', 0):.3f}"
+            )
+        
+        # Optionally save results
+        out_dir = Path("outputs")
+        out_dir.mkdir(exist_ok=True)
+        out_file = out_dir / f"discovery_{args.pair}_{args.timeframe}.json"
+        results = [ind.to_dict() for ind in ranked]
+        with open(out_file, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        logger.info(f"Results saved to {out_file}")
         
         return 0
     except Exception as e:
-        logger.error(f"Discovery failed: {e}", exc_info=args.verbose)
+        logger.error(f"Discovery failed: {e}", exc_info=getattr(args, 'verbose', False))
         return 1
 
 

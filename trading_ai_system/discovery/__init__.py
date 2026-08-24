@@ -1,5 +1,6 @@
 from trading_ai_system.discovery.discovery import (
     Discovery,
+    DiscoveryConfig,
     IndicatorMetric,
     PatternMetric,
     IndicatorCombination,
@@ -10,6 +11,7 @@ from trading_ai_system.discovery.discovery import (
 
 __all__ = [
     'Discovery',
+    'DiscoveryConfig',
     'IndicatorMetric',
     'PatternMetric',
     'IndicatorCombination',
