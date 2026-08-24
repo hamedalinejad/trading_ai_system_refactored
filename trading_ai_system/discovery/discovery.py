@@ -1299,7 +1299,7 @@ class Discovery:
     def discover_combinations(
         self,
         df: pd.DataFrame,
-        target_column: str = "returns",
+        target_column: str = "return_1bar",
         max_combination_size: Optional[int] = None,
         min_score: float = 0.55
     ) -> Dict[str, IndicatorCombination]:

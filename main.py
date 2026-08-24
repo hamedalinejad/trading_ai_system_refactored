@@ -338,11 +338,42 @@ def handle_discovery_command(args: argparse.Namespace) -> int:
                 f"| wr={ind.win_rate:.2%} | sharpe={getattr(ind, 'sharpe_ratio', 0):.3f}"
             )
         
-        # Optionally save results
+        # Discover combinations of top indicators
+        combos = {}
+        try:
+            logger.info("Searching indicator combinations...")
+            # Limit to top indicators to keep combinatorial cost low on CPU
+            top_names = [ind.name for ind in ranked[:8]]
+            # Temporarily restrict indicator set for combo search
+            disc.indicators = {k: v for k, v in disc.indicators.items() if k in top_names}
+            combos = disc.discover_combinations(
+                df_feat, target_column="return_1bar", max_combination_size=2, min_score=0.55
+            )
+            if combos:
+                ranked_combos = sorted(
+                    combos.values(),
+                    key=lambda c: getattr(c, "effective_score", lambda: 0)() if callable(getattr(c, "effective_score", None)) else getattr(c, "combined_score", 0),
+                    reverse=True
+                )[:5]
+                logger.info("-" * 60)
+                logger.info(f"TOP {len(ranked_combos)} COMBINATIONS")
+                for i, c in enumerate(ranked_combos, 1):
+                    names = "+".join(c.indicators) if hasattr(c, "indicators") else str(c)
+                    score = getattr(c, "combined_score", getattr(c, "effective_score", 0))
+                    if callable(score):
+                        score = score()
+                    logger.info(f"{i:2d}. {names:40s} | score={score:.4f}")
+        except Exception as e:
+            logger.warning(f"Combination discovery skipped: {e}")
+        
+        # Save results
         out_dir = Path("outputs")
         out_dir.mkdir(exist_ok=True)
         out_file = out_dir / f"discovery_{args.pair}_{args.timeframe}.json"
-        results = [ind.to_dict() for ind in ranked]
+        results = {
+            "indicators": [ind.to_dict() for ind in ranked],
+            "combinations": [c.to_dict() for c in combos.values()] if combos else [],
+        }
         with open(out_file, "w") as f:
             json.dump(results, f, indent=2, default=str)
         logger.info(f"Results saved to {out_file}")
