@@ -267,7 +267,7 @@ def clean_ohlcv_data(
         raise DataCleaningError(f"Required columns missing: {missing_cols}")
     
     initial_count = len(df_clean)
-    logger.info(f"clean_ohlcv_data: processing {initial_count:,} rows")
+    logger.debug(f"clean_ohlcv_data: processing {initial_count:,} rows")
     
     try:
         # Ensure timestamp is naive UTC
@@ -361,7 +361,7 @@ def clean_ohlcv_data(
         
         final_count = len(df_clean)
         removed_total = initial_count - final_count
-        logger.info(f"clean_ohlcv_data complete: {final_count:,} rows ({removed_total:,} removed)")
+        logger.debug(f"clean_ohlcv_data complete: {final_count:,} rows ({removed_total:,} removed)")
         
         return df_clean
     
@@ -678,7 +678,7 @@ class DataLoader:
     
     def __init__(self):
         self._lock = Lock()
-        logger.info("DataLoader initialized")
+        logger.debug("DataLoader initialized")
     
     def load_csv(
         self,

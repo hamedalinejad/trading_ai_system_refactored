@@ -285,7 +285,7 @@ class Discovery:
         self._lock = Lock()
         self.discovery_history: List[Dict[str, Any]] = []
         self._indicator_definitions: Dict[str, IndicatorDefinition] = {}
-        logger.info(f"Discovery initialized with config: {self.config.to_dict()}")
+        logger.debug(f"Discovery initialized with config: {self.config.to_dict()}")
     
     # ==================== INDICATOR DEFINITION MANAGEMENT ====================
     

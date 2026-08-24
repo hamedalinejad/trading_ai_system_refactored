@@ -139,7 +139,7 @@ class FeatureCache:
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._hash_cache: Dict[str, str] = {}
         self._lock = Lock()
-        logger.info(f"FeatureCache initialized (enabled={enable_caching})")
+        logger.debug(f"FeatureCache initialized (enabled={enable_caching})")
     
     def get(self, key: str, data_hash: str) -> Optional[pd.DataFrame]:
         if not self.enable_caching:
@@ -675,7 +675,7 @@ def engineer_features_for_timeframe(
         df_feat = df.copy()
         df_feat = df_feat.astype({col: float for col in required_cols}, errors='ignore')
         
-        logger.info(f"engineer_features: {len(df_feat)} rows, timeframe={timeframe}")
+        logger.debug(f"engineer_features: {len(df_feat)} rows, timeframe={timeframe}")
         
         generated_features = []
         
@@ -887,7 +887,7 @@ def engineer_features_for_timeframe(
                 logger.debug(f"Failed to register {feat_name}: {e}")
         
         feature_count = len([c for c in df_feat.columns if c not in df.columns])
-        logger.info(f"engineer_features: generated {feature_count} features")
+        logger.debug(f"engineer_features: generated {feature_count} features")
         
         if use_cache:
             feature_cache.set(cache_key, df_feat, data_hash)
