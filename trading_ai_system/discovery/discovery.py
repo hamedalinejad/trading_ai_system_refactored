@@ -361,7 +361,7 @@ class Discovery:
             return None
         
         if indicator_name not in df.columns or target_column not in df.columns:
-            logger.warning(f"Missing columns: {indicator_name} or {target_column}")
+            logger.debug(f"Missing columns: {indicator_name} or {target_column}")
             return None
         
         try:
@@ -427,7 +427,7 @@ class Discovery:
                 if self.config.caching_enabled:
                     self._indicator_cache[indicator_name] = metric
             
-            logger.info(
+            logger.debug(
                 f"Analyzed {indicator_name}: score={metric.composite_score():.4f}, "
                 f"wr={metric.win_rate:.2%}, pf={metric.profit_factor:.2f}, "
                 f"brier={metric.brier_score:.4f}"
