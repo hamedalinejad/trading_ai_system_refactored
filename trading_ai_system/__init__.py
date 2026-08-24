@@ -32,7 +32,7 @@ try:
         __description__,
     )
 except ImportError:
-    __version__ = "0.79.4"
+    __version__ = "0.79.5"
     __author__ = "Hamed Alinejad"
     __description__ = "Trading AI System with ML and Discovery"
 
