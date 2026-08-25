@@ -182,6 +182,20 @@ For more information, visit: https://github.com/hamedalinejad/trading_ai_system_
     discovery_parser.add_argument('--min-samples', type=int, default=100, help='Minimum samples for discovery')
     discovery_parser.add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: cpu_count-1 or 2)')
 
+    highwr_parser = subparsers.add_parser(
+        'highwr',
+        help='Discover high / perfect win-rate discrete rules (deep search)'
+    )
+    highwr_parser.add_argument('-p', '--pair', type=str, default='EURUSD', help='Trading pair')
+    highwr_parser.add_argument('-d', '--data', type=str, required=True, help='Path to data file (parquet/csv)')
+    highwr_parser.add_argument('--timeframe', type=str, default='1h', help='Timeframe filter')
+    highwr_parser.add_argument('--min-wr', type=float, default=0.75, help='Minimum in-sample win rate')
+    highwr_parser.add_argument('--min-trades', type=int, default=30, help='Minimum in-sample trades')
+    highwr_parser.add_argument('--horizon', type=int, default=1, help='Forward bars for outcome')
+    highwr_parser.add_argument('--cost', type=float, default=0.0001, help='Cost per side (e.g. 0.0001 = 1 pip)')
+    highwr_parser.add_argument('--perfect', action='store_true', help='Hunt only for ~100%% WR rules')
+    highwr_parser.add_argument('--top', type=int, default=20, help='Top N rules to show')
+
     system_parser = subparsers.add_parser('system', help='System information')
     system_subparsers = system_parser.add_subparsers(dest='system_command', help='System subcommand')
     system_subparsers.add_parser('info', help='Show system info')
@@ -384,6 +398,123 @@ def handle_discovery_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def handle_highwr_command(args: argparse.Namespace) -> int:
+    """Deep search for high / perfect win-rate discrete rules."""
+    try:
+        from trading_ai_system import data, features
+        from trading_ai_system.discovery.high_wr import (
+            discover_high_wr_rules,
+            find_perfect_wr_rules,
+        )
+        from pathlib import Path
+
+        data_path = Path(args.data)
+        if not data_path.exists():
+            logger.error(f"Data file not found: {data_path}")
+            return 1
+
+        logger.info("=" * 70)
+        logger.info("HIGH WIN-RATE RULE DISCOVERY (deep search)")
+        logger.info("NOTE: 100% WR on real markets with costs is not robustly achievable.")
+        logger.info("      Rules with 100% IS WR are almost always overfit — check OOS.")
+        logger.info("=" * 70)
+
+        loader = data.DataLoader()
+        if data_path.suffix.lower() in (".parquet", ".pq"):
+            df = loader.load_parquet(data_path)
+        else:
+            df = loader.load_csv(data_path)
+
+        if "symbol" in df.columns:
+            df = df[df["symbol"].astype(str).str.upper() == args.pair.upper()].copy()
+        if "timeframe" in df.columns:
+            tf_map = {
+                "1m": "1min", "1min": "1min", "5m": "5min", "5min": "5min",
+                "15m": "15min", "15min": "15min", "30m": "30min", "30min": "30min",
+                "1h": "1h", "h1": "1h", "4h": "4h", "h4": "4h", "1d": "1d", "d1": "1d",
+            }
+            target = tf_map.get(args.timeframe.lower(), args.timeframe.lower())
+            df["tf_norm"] = df["timeframe"].astype(str).str.lower().map(lambda x: tf_map.get(x, x))
+            df = df[df["tf_norm"] == target].drop(columns=["tf_norm"], errors="ignore")
+        if "is_market_open" in df.columns:
+            df = df[df["is_market_open"] == 1].copy()
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        df = data.clean_ohlcv_data(df)
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+
+        df_feat, _ = features.engineer_features_for_timeframe(
+            df, timeframe=args.timeframe, compute_advanced=True, use_discovery=False, use_cache=True
+        )
+        logger.info(f"Feature matrix: {len(df_feat):,} rows x {len(df_feat.columns)} cols")
+
+        if args.perfect:
+            rules = find_perfect_wr_rules(
+                df_feat,
+                horizon=args.horizon,
+                min_trades=max(5, args.min_trades // 3),
+                cost_per_side=args.cost,
+                top_k=args.top,
+            )
+            logger.info(f"Perfect (~100% IS WR) rules found: {len(rules)}")
+        else:
+            rules = discover_high_wr_rules(
+                df_feat,
+                horizon=args.horizon,
+                min_trades=args.min_trades,
+                min_win_rate=args.min_wr,
+                cost_per_side=args.cost,
+                top_k=args.top,
+            )
+            logger.info(f"High-WR rules found: {len(rules)}")
+
+        if not rules:
+            logger.warning("No rules met the criteria. Try lower --min-wr or --min-trades.")
+            return 0
+
+        logger.info("-" * 70)
+        logger.info(
+            f"{'#':<3} {'Dir':<6} {'IS_WR':>7} {'Trades':>7} {'OOS_WR':>7} {'OOS_n':>6} "
+            f"{'PF':>6} {'AvgRet':>10}  Conditions"
+        )
+        logger.info("-" * 70)
+        for i, r in enumerate(rules[: args.top], 1):
+            cond = " AND ".join(r.conditions)
+            logger.info(
+                f"{i:<3} {r.direction:<6} {r.win_rate*100:6.1f}% {r.n_trades:7d} "
+                f"{r.oos_win_rate*100:6.1f}% {r.oos_n_trades:6d} "
+                f"{r.profit_factor:6.2f} {r.avg_return:10.6f}  {cond}"
+            )
+
+        # Highlight any that keep high OOS WR
+        robust = [r for r in rules if r.win_rate >= 0.9 and r.oos_win_rate >= 0.65 and r.oos_n_trades >= 10]
+        if robust:
+            logger.info("=" * 70)
+            logger.info(f"RELATIVELY ROBUST (IS>=90% and OOS>=65% with enough OOS trades): {len(robust)}")
+            for r in robust[:10]:
+                logger.info(
+                    f"  {r.direction} | IS={r.win_rate:.1%} ({r.n_trades}) | "
+                    f"OOS={r.oos_win_rate:.1%} ({r.oos_n_trades}) | {r.conditions}"
+                )
+        else:
+            logger.info("=" * 70)
+            logger.info("No rule kept both very high IS WR and solid OOS WR — expected in efficient markets.")
+
+        out_dir = Path("outputs")
+        out_dir.mkdir(exist_ok=True)
+        out_file = out_dir / f"highwr_{args.pair}_{args.timeframe}.json"
+        with open(out_file, "w") as f:
+            json.dump([r.to_dict() for r in rules[: args.top]], f, indent=2, default=str)
+        logger.info(f"Saved: {out_file}")
+        return 0
+    except Exception as e:
+        logger.error(f"High-WR discovery failed: {e}", exc_info=getattr(args, "verbose", False))
+        return 1
+
+
 def handle_system_command(args: argparse.Namespace) -> int:
     """Handle system command"""
     try:
@@ -435,6 +566,9 @@ def run_command(args: argparse.Namespace) -> int:
 
         if args.command == 'discovery':
             return handle_discovery_command(args)
+
+        elif args.command == 'highwr':
+            return handle_highwr_command(args)
         
         elif args.command == 'system':
             return handle_system_command(args)
